@@ -24,6 +24,7 @@ from utils.constants import (
     SMPLModelType,
 )
 from pathlib import Path
+import glob
 
 @dataclass
 class DatasetDataStruct:
@@ -86,30 +87,20 @@ def parse_data_struct(
         and "head_global_trans_list" in data_dict
     ):
         gt_dict[DataTypeGT.HEAD_MOTION] = data_dict["head_global_trans_list"]
+    # Uniform setting: SMPLH + male + zero betas. Gender / model type are forced;
+    # betas are read from body_parms_list (the prep script writes zeros explicitly).
     if (
         DataTypeGT.SHAPE_PARAMS in keys_to_parse
         and "body_parms_list" in data_dict
         and "betas" in data_dict["body_parms_list"]
     ):
         gt_dict[DataTypeGT.SHAPE_PARAMS] = data_dict["body_parms_list"]["betas"][1:]
-    if DataTypeGT.SMPL_GENDER in keys_to_parse and "gender" in data_dict:
-        gt_dict[DataTypeGT.SMPL_GENDER] = SMPLGenderParam[
-            str(data_dict["gender"]).upper()
-        ]
-    if (
-        DataTypeGT.SMPL_MODEL_TYPE in keys_to_parse
-        and "surface_model_type" in data_dict
-    ):
-        model_type = data_dict["surface_model_type"]
-        if not isinstance(model_type, str):
-            model_type = model_type.item()
-        gt_dict[DataTypeGT.SMPL_MODEL_TYPE] = SMPLModelType.parse(model_type)
-    elif DataTypeGT.SMPL_MODEL_TYPE in keys_to_parse:
-        gt_dict[DataTypeGT.SMPL_MODEL_TYPE] = SMPLModelType.SMPLH  # default
-
-    if DataTypeGT.SHAPE_PARAMS not in gt_dict:
-        # if shape params are not available, use the default shape --> retrocompatibility
+    if DataTypeGT.SMPL_GENDER in keys_to_parse:
         gt_dict[DataTypeGT.SMPL_GENDER] = SMPLGenderParam.MALE
+    if DataTypeGT.SMPL_MODEL_TYPE in keys_to_parse:
+        gt_dict[DataTypeGT.SMPL_MODEL_TYPE] = SMPLModelType.SMPLH
+    if DataTypeGT.BOOTSTRAP in keys_to_parse:
+        gt_dict[DataTypeGT.BOOTSTRAP] = data_dict["bootstrap"]
     return gt_dict, cond_dict
 
 
@@ -315,10 +306,37 @@ class TestDataset(Dataset):
         self.use_real_input = use_real_input
         self.input_conf_threshold = input_conf_threshold
 
+        # load bootstrap data if not using GT for initialization
+        self.gt_init = kwargs.get("gt_init", True)
+        if not self.gt_init:
+            logger.info("TestDataset: Using bootstrap data instead of GT for initialization.")
+            bootstrap_data = load_bootstrap_data(kwargs["bootstrap_data_path"])
+            print(bootstrap_data[0]['pred_local_pose'].device)
+            prefix_list = [d['filepath'][:-11] for d in dataset_data.data]
+            self.bootstrap_data = [bp for bp in bootstrap_data if bp['filepath'][:-9] in prefix_list]
+            assert len(self.bootstrap_data) == len(dataset_data.data), \
+                f"Number of bootstrap data {len(self.bootstrap_data)} does not match number of test sequences {len(dataset_data.data)}."
+            prefix_mismtach_cnt = 0
+            length_mismtach_cnt = 0
+            for i in range(len(dataset_data.data)):
+                if dataset_data.data[i]['filepath'][:-11] != self.bootstrap_data[i]['filepath'][:-9]:
+                    prefix_mismtach_cnt += 1
+                len_original = dataset_data.data[i]['rotation_local_full_gt_list'].shape[0]
+                len_bootstrap = self.bootstrap_data[i]['pred_local_pose'].shape[0]
+                if len_original != len_bootstrap:
+                    length_mismtach_cnt += 1
+                    self.bootstrap_data[i]['pred_local_pose'] = self.bootstrap_data[i]['pred_local_pose'][:len_original]
+            if prefix_mismtach_cnt > 0:
+                logger.warning(f"Prefix mismatch count: {prefix_mismtach_cnt}")
+            if length_mismtach_cnt > 0:
+                logger.warning(f"Length mismatch count: {length_mismtach_cnt}")
+            # assert prefix_mismtach_cnt == 0, "Prefix mismatch found in bootstrap data."
+            # assert length_mismtach_cnt == 0, "Length mismatch found in bootstrap data."
+            
         self.filename_list = []
         self.data = []
         filtered = 0
-        for filename, info in zip(dataset_data.filename_list, dataset_data.data):
+        for idx, (filename, info) in enumerate(zip(dataset_data.filename_list, dataset_data.data)):
             hmd = info["hmd_position_global_full_gt_list"]
             if hmd.shape[0] < min_frames or hmd.shape[0] > max_frames:
                 filtered += 1
@@ -330,6 +348,13 @@ class TestDataset(Dataset):
                 info["rotation_local_full_gt_list"] = torch.zeros(
                     (hmd.shape[0], num_features)
                 )
+            if not self.gt_init:
+                info['bootstrap'] = self.bootstrap_data[idx]['pred_local_pose']
+            else:
+                # gt_init=True: bootstrap is unused at eval time but must still be
+                # a tensor so padding_collate can pad it. Use zeros matching the
+                # GT rotation shape.
+                info['bootstrap'] = torch.zeros_like(info['rotation_local_full_gt_list'])
             self.data.append(info)
             self.filename_list.append(filename)
         logger.info(f"Filtered {filtered}/{len(dataset_data.data)} sequences")
@@ -397,6 +422,7 @@ class TestDataset(Dataset):
             DataTypeGT.HEAD_MOTION,
             DataTypeGT.SMPL_MODEL_TYPE,
             DataTypeGT.SMPL_GENDER,
+            DataTypeGT.BOOTSTRAP,
         }
         gt_dict, cond_dict = parse_data_struct(
             data_dict, keys, self.use_real_input, self.input_conf_threshold
@@ -474,7 +500,8 @@ def load_data(
         motion_list = motion_list[:max_samples]
     mean_path, std_path = get_mean_std_path(dataset)
     logger.info(f"Loading '{split}' data: {dataset_path}")
-    data = [torch.load(i) for i in tqdm(motion_list)]
+    data = [torch.load(i, weights_only=False) for i in tqdm(motion_list)]
+    data.sort(key=lambda x: x["filepath"])
 
     filename_list = [
         "-".join([i.parts[-3], i.parts[-1]]).split(".")[0]
@@ -555,3 +582,9 @@ def get_dataloader(dataset, split, batch_size, num_workers=32, persistent_worker
         persistent_workers=persistent_workers,
     )
     return loader
+
+def load_bootstrap_data(data_dir):
+    bootstrap_files = glob.glob(os.path.join(data_dir, f"*.pt"))
+    bootstrap_data = [torch.load(f, weights_only=False, map_location='cpu') for f in bootstrap_files]
+    bootstrap_data.sort(key=lambda x: x['filepath']) # sort bootstrap data by filepath to ensure consistent order
+    return bootstrap_data

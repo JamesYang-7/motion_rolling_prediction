@@ -283,6 +283,15 @@ def add_data_options(parser):
         help="Config file with the gaps configuration for evaluating the tracking signal loss.",
     )
     group.add_argument(
+        "--eval_skip_frames",
+        type=lambda s: [int(x) for x in s.split(",") if x.strip() != ""],
+        default=[0, 79],
+        help="Comma-separated list of leading-frame counts to drop before "
+             "computing metrics. Default '0,79' produces both skip-0 and "
+             "skip-79f artifacts (matches VR_Pose_Pred). Sequences shorter "
+             "than (skip + 4) are dropped from that skip's aggregation.",
+    )
+    group.add_argument(
         "--use_real_input",
         action="store_true",
         help="use real tracking input signal",
@@ -417,6 +426,9 @@ def add_sampling_options(parser):
         action="store_true",
         help="If True, it will export all data needed for building the Unity scene.",
     )
+    group.add_argument("--no_gt_init", action="store_true", help="Do not use GT for initialization.")
+    group.add_argument("--bootstrap_data_path", type=Path, default=None,
+                       help="Path to the bootstrap data file (used when --no_gt_init is set).")
 
 
 def add_evaluation_options(parser):

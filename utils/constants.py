@@ -25,6 +25,8 @@ class DatasetType(str, Enum):
     AMASS_P1 = "amass_p1"
     AMASS_P2 = "amass_p2"
     GORP = "gorp"
+    AMASS_P1_GENDERED_UNSHAPED = "amass_p1_gendered_unshaped"
+    AMASS_P1_GENDERED_SHAPED = "amass_p1_gendered_shaped"
 
 
 class MotionLossType(str, Enum):
@@ -49,6 +51,7 @@ class DataTypeGT(str, Enum):
     FILENAME = "FILENAME"
     NUM_FRAMES = "NUM_FRAMES"
     SMPL_MODEL_TYPE = "SMPL_MODEL_TYPE"
+    BOOTSTRAP = "BOOTSTRAP"
 
 
 class ModelOutputType(str, Enum):

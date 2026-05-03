@@ -49,6 +49,8 @@ class RestrictType(str, Enum):
 
 BODY_ENTITIES = {
     "all": list(range(22)),
+    # body = all 21 non-root joints; matches VR_Pose_Pred's mpjre over `pose_body[:, 3:]`
+    "body": list(range(1, 22)),
     "hands": [20, 21],
     "upper": [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
     "lower": [0, 1, 2, 4, 5, 7, 8, 10, 11],
@@ -283,10 +285,12 @@ def mpjve(
     joints: str = "all",
     restrict: RestrictType = RestrictType.NONE,
 ):
-    gt_velocity = (data.gt_positions[1:, ...] - data.gt_positions[:-1, ...]) * data.fps
-    predicted_velocity = (
-        data.pred_positions[1:, ...] - data.pred_positions[:-1, ...]
-    ) * data.fps
+    assert joints in BODY_ENTITIES, f"unknown '{joints}' entity"
+    idx = BODY_ENTITIES[joints]
+    gt_pos = data.gt_positions[..., idx, :]
+    pr_pos = data.pred_positions[..., idx, :]
+    gt_velocity = (gt_pos[1:] - gt_pos[:-1]) * data.fps
+    predicted_velocity = (pr_pos[1:] - pr_pos[:-1]) * data.fps
     vel_error = th.sqrt(th.sum(th.square(gt_velocity - predicted_velocity), dim=-1))
 
     result = restrict_and_mean(vel_error, restrict, data.trackingloss_masks)
@@ -294,21 +298,24 @@ def mpjve(
 
 
 METRIC_FUNCS_DICT = {
-    "mpjre": mpjre,
+    # rotation errors (deg). mpjre is body-only (21 joints) to match VR_Pose_Pred.
+    "mpjre": partial(mpjre, joints="body"),
+    "rootre": partial(mpjre, joints="root"),
+    "upperre": partial(mpjre, joints="upper"),
+    "lowerre": partial(mpjre, joints="lower"),
+    # position errors (cm). mpjpe over all 22 joints; subgroups split out.
     "mpjpe": mpjpe,
+    "handpe": partial(mpjpe, joints="hands"),
+    "upperpe": partial(mpjpe, joints="upper"),
+    "lowerpe": partial(mpjpe, joints="lower"),
+    "rootpe": partial(mpjpe, joints="root"),
+    # velocity errors (cm/s).
     "mpjve": mpjve,
-    #"handpe": partial(mpjpe, joints="hands"),
-    #"upperpe": partial(mpjpe, joints="upper"),
-    #"lowerpe": partial(mpjpe, joints="lower"),
-    #"rootpe": partial(mpjpe, joints="root"),
+    "upperve": partial(mpjve, joints="upper"),
+    "lowerve": partial(mpjve, joints="lower"),
+    # jitter (m/s^3).
     "pred_jitter": partial(jitter, joints="all", target="pred"),
-    #"pred_H_jitter": partial(jitter, joints="hands", target="pred"),
-    #"pred_UB_jitter": partial(jitter, joints="upper", target="pred"),
-    #"pred_LB_jitter": partial(jitter, joints="lower", target="pred"),
     "gt_jitter": partial(jitter, joints="all", target="gt"),
-    #"gt_H_jitter": partial(jitter, joints="hands", target="gt"),
-    #"gt_UB_jitter": partial(jitter, joints="upper", target="gt"),
-    #"gt_LB_jitter": partial(jitter, joints="lower", target="gt"),
 }
 
 ARRAY_BASED_METRICS = ["S_to_T_jerk", "T_to_S_jerk", "gt_S_to_T_jerk", "gt_T_to_S_jerk"]
@@ -428,17 +435,10 @@ METRIC_FUNCS_DICT_TRACKING_LOSS = {
 
 
 LOGGING_METRICS = {
-    "mpjre",
-    "mpjpe",
-    "mpjve",
-    # "handpe",
-    # "upperpe",
-    # "lowerpe",
-    # "rootpe",
-    "pred_jitter",
-    "gt_jitter",
-    # "trf_pred_jitter",
-    # "trf_pred_H_jitter",
+    "mpjre", "rootre", "upperre", "lowerre",
+    "mpjpe", "handpe", "upperpe", "lowerpe", "rootpe",
+    "mpjve", "upperve", "lowerve",
+    "pred_jitter", "gt_jitter",
 }
 
 

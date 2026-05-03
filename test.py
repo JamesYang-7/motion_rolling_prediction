@@ -42,6 +42,8 @@ def main():
         use_real_input=args.use_real_input,
         input_conf_threshold=args.input_conf_threshold,
         test_split=args.test_split,
+        gt_init=not args.no_gt_init,
+        bootstrap_data_path=args.bootstrap_data_path,
     )
     logger.info("Loading model...")
     model, _ = load_rpm_model(args, device=device)
@@ -99,12 +101,21 @@ def main():
             device,
             batch_size=args.eval_batch_size,
         )
-        log, all_results_df, arr_based_metrics = evaluator.evaluate_all()
-        csv_path = output_dir / f"results_{args.dataset}.csv"
-        evaluator.store_all_results(all_results_df, csv_path)
-        more_metrics = evaluator.store_plots(arr_based_metrics, output_dir)
-        log.update(more_metrics)
-        evaluator.print_results(log)
+        results_per_skip = evaluator.evaluate_all()
+        for skip, (log, all_results_df, arr_based_metrics) in sorted(results_per_skip.items()):
+            suffix = f"_skip{skip}f"
+            evaluator.store_all_results(
+                all_results_df, output_dir / f"results_{args.dataset}{suffix}.csv"
+            )
+            evaluator.store_avg_results(
+                log, output_dir / f"avg_{args.dataset}{suffix}.csv"
+            )
+            more_metrics = evaluator.store_plots(
+                arr_based_metrics, output_dir, suffix=suffix
+            )
+            log.update(more_metrics)
+            logger.info(f"=== skip-{skip}f ===")
+            evaluator.print_results(log)
 
 
 if __name__ == "__main__":

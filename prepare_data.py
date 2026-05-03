@@ -198,7 +198,7 @@ def main(args, device="cuda:0"):
                     continue
                 bdata_poses = bdata["poses"][downsamp_inds, ...]
                 bdata_trans = bdata["trans"][downsamp_inds, ...]
-                smpl_gender = bdata["gender"]
+                smpl_gender = bdata["gender"].item()
 
                 body_parms = {
                     "root_orient": torch.Tensor(
@@ -255,7 +255,7 @@ def run():
     parser.add_argument(
         "--support_dir",
         type=str,
-        default=None,
+        default="./SMPL/",
         help="=dir where you put your smplh and dmpls dirs",
     )
     parser.add_argument(

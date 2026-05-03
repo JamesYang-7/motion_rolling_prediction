@@ -50,6 +50,7 @@ def padding_collate(batch):
         DataTypeGT.RELATIVE_ROTS,
         DataTypeGT.SPARSE,
         DataTypeGT.HEAD_MOTION,
+        DataTypeGT.BOOTSTRAP
     }
     assert len(batch) > 0, "Batch is empty"
     gt_data, cond_data = {}, {}
@@ -107,7 +108,15 @@ class EvaluatorWrapper:
         self.device = device
         self.body_model = body_model
         self.fps = get_dataset_fps(self.dataset_name)
-        self.MIN_FRAMES_TO_EVAL = get_min_frames_to_eval(self.dataset_name)
+        # eval_skip_frames is a list of leading-frame counts to drop before
+        # computing metrics. Default [0, 79] mirrors VR_Pose_Pred's two save
+        # variants. The model FK runs once; only the metric slice changes.
+        eval_skip = getattr(args, "eval_skip_frames", None)
+        if eval_skip is None:
+            eval_skip = [0, 79]
+        elif isinstance(eval_skip, int):
+            eval_skip = [eval_skip]
+        self.eval_skip_frames = list(eval_skip)
         self.batch_size = batch_size
 
         # initialize data loader. Sorting the dataset by sequence length to
@@ -121,7 +130,7 @@ class EvaluatorWrapper:
             pin_memory=True,
             drop_last=False,
             collate_fn=padding_collate,
-            sampler=SortedSampler(self.dataset, min_frames=self.MIN_FRAMES_TO_EVAL + 3),
+            # sampler=SortedSampler(self.dataset, min_frames=self.MIN_FRAMES_TO_EVAL + 3),
         )
 
     def evaluate_from_prediction(
@@ -135,6 +144,11 @@ class EvaluatorWrapper:
         model_type: SMPLModelType,
         betas=None,
     ):
+        """Run FK once, then compute metrics at every skip in self.eval_skip_frames.
+
+        Returns dict[skip → eval_log]. Skips that exceed the sequence length
+        (after the jitter T-3 guard) are silently dropped from the output.
+        """
         pr_body = get_body_poses(
             output,
             self.body_model,
@@ -154,45 +168,44 @@ class EvaluatorWrapper:
             model_type,
         )
 
-        pr_pos = pr_body.Jtr[self.MIN_FRAMES_TO_EVAL - 1 :, :22, :]
-        pr_angle = pr_body.full_pose.reshape(pr_body.Jtr.shape)[
-            self.MIN_FRAMES_TO_EVAL - 1 :, :22
-        ]
+        pr_pos_full = pr_body.Jtr[:, :22, :]
+        pr_angle_full = pr_body.full_pose.reshape(pr_body.Jtr.shape)[:, :22]
+        gt_pos_full = gt_body.Jtr[:, :22, :]
+        gt_angle_full = gt_body.full_pose.reshape(pr_body.Jtr.shape)[:, :22]
+        total_frames = pr_pos_full.shape[0]
 
-        gt_pos = gt_body.Jtr[self.MIN_FRAMES_TO_EVAL - 1 :, :22, :]
-        gt_angle = gt_body.full_pose.reshape(pr_body.Jtr.shape)[
-            self.MIN_FRAMES_TO_EVAL - 1 :, :22
-        ]
+        eval_logs_per_skip = {}
+        for skip in self.eval_skip_frames:
+            if skip >= total_frames - 3:
+                # not enough frames left for jitter (needs T-3); drop this skip
+                continue
 
-        metrics_sets = [
-            get_all_metrics(),
-        ]
-        masks, processed_gaps = None, None
-        if gaps is not None:
-            metrics_sets.append(get_all_metrics_trackingloss())
-            masks = from_gaps_to_masks(
-                gaps, output.shape[0], self.MIN_FRAMES_TO_EVAL - 1
+            metrics_sets = [get_all_metrics()]
+            masks, processed_gaps = None, None
+            if gaps is not None:
+                metrics_sets.append(get_all_metrics_trackingloss())
+                masks = from_gaps_to_masks(gaps, total_frames, skip)
+                processed_gaps = remove_frames_to_gaps(gaps, skip)
+
+            metrics_input_data = MetricsInputData(
+                pred_positions=pr_pos_full[skip:],
+                pred_angles=pr_angle_full[skip:],
+                pred_mesh=pr_body.v[skip:],
+                gt_positions=gt_pos_full[skip:],
+                gt_angles=gt_angle_full[skip:],
+                gt_mesh=gt_body.v[skip:],
+                fps=self.fps,
+                trackingloss_masks=masks,
+                gaps=processed_gaps,
             )
-            processed_gaps = remove_frames_to_gaps(gaps, self.MIN_FRAMES_TO_EVAL - 1)
-
-        metrics_input_data = MetricsInputData(
-            pred_positions=pr_pos,
-            pred_angles=pr_angle,
-            pred_mesh=pr_body.v[self.MIN_FRAMES_TO_EVAL - 1 :],
-            gt_positions=gt_pos,
-            gt_angles=gt_angle,
-            gt_mesh=gt_body.v[self.MIN_FRAMES_TO_EVAL - 1 :],
-            fps=self.fps,
-            trackingloss_masks=masks,
-            gaps=processed_gaps,
-        )
-        eval_log = {}
-        for metrics in metrics_sets:
-            for metric in metrics:
-                eval_log[metric] = (
-                    get_metric_function(metric)(metrics_input_data).cpu().numpy()
-                )
-        return eval_log
+            eval_log = {}
+            for metrics in metrics_sets:
+                for metric in metrics:
+                    eval_log[metric] = (
+                        get_metric_function(metric)(metrics_input_data).cpu().numpy()
+                    )
+            eval_logs_per_skip[skip] = eval_log
+        return eval_logs_per_skip
 
     def evaluate_single(self, sample_idx):
         gt_dict, cond_dict = self.dataset[sample_idx]
@@ -208,7 +221,7 @@ class EvaluatorWrapper:
             gt_data.unsqueeze(0),
             sparse.unsqueeze(0),
             body_model=self.body_model.get_body_model(
-                SMPLModelType.SMPLX, SMPLGenderParam.NEUTRAL
+                SMPLModelType.SMPLH, SMPLGenderParam.MALE
             ),
             filenames=gt_dict[DataTypeGT.FILENAME],
         )
@@ -243,11 +256,17 @@ class EvaluatorWrapper:
         )
 
     def evaluate_all(self):
-        log = {}
-        fine_grained_results = []
-        total_samples = 0
+        """Run inference + metrics for every skip in self.eval_skip_frames.
+
+        Returns dict[skip → (summary_log, fine_grained_df, arr_based_metrics)].
+        Per-sample short sequences (skip >= T-3) are dropped from that skip's
+        aggregation but still contribute to lower skips.
+        """
+        logs_per_skip = {skip: {} for skip in self.eval_skip_frames}
+        fine_grained_per_skip = {skip: [] for skip in self.eval_skip_frames}
+        flag = False
         with torch.no_grad():
-            for gt_dict, cond_dict in tqdm(self.data_loader):
+            for i, (gt_dict, cond_dict) in tqdm(enumerate(self.data_loader)):
                 gt_data = gt_dict[DataTypeGT.RELATIVE_ROTS]
                 sparse = cond_dict[DataTypeGT.SPARSE]
                 body_param = gt_dict[DataTypeGT.BODY_PARAMS]
@@ -257,6 +276,13 @@ class EvaluatorWrapper:
                 filenames = gt_dict[DataTypeGT.FILENAME]
                 gt_genders = gt_dict[DataTypeGT.SMPL_GENDER]
                 model_types = gt_dict[DataTypeGT.SMPL_MODEL_TYPE]
+                bootstrap_data = gt_dict[DataTypeGT.BOOTSTRAP]
+                # print(f"### len(bootstrap_data): {len(bootstrap_data)}, len gt_data: {len(gt_data)} ###")
+                # for i in range(len(bootstrap_data)):
+                #     print(f"### bootstrap_data[{i}] shape: {bootstrap_data[i].shape}, gt_data[{i}] shape: {gt_data[i].shape} ###")
+
+                if not self.dataset.gt_init:
+                    gt_data = bootstrap_data
 
                 batch_size = len(num_frames)
 
@@ -265,13 +291,14 @@ class EvaluatorWrapper:
                     gt_data,
                     sparse,
                     body_model=self.body_model.get_body_model(
-                        SMPLModelType.SMPLX, SMPLGenderParam.NEUTRAL
+                        SMPLModelType.SMPLH, SMPLGenderParam.MALE
                     ),
                     filenames=filenames,
                 )
 
                 local_rot = output[ModelOutputType.RELATIVE_ROTS]
                 betas = None
+                version_info = ""
                 if (
                     DataTypeGT.SHAPE_PARAMS in gt_dict
                     and ModelOutputType.SHAPE_PARAMS in output
@@ -282,15 +309,23 @@ class EvaluatorWrapper:
                     pred_genders = [
                         SMPLGenderParam.NEUTRAL,
                     ] * batch_size
+                    version_info = " (using 'neutral' gender and predicted shape params)"
                 elif DataTypeGT.SHAPE_PARAMS in gt_dict:
                     # new version + no params predicted -- use GT
                     betas = gt_dict[DataTypeGT.SHAPE_PARAMS]
                     pred_genders = gt_genders
+                    version_info = " (using GT gender and GT shape params)"
                 else:
                     # old version of dataset where MALE is default, and shape is not predictable
                     pred_genders = [
                         SMPLGenderParam.MALE,
                     ] * batch_size
+                    version_info = " (using male and no shape params)"
+                if not flag:
+                    logger.info(
+                        f"EvaluatorWrapper: Dataset version info:{version_info}, GT init: {self.dataset.gt_init}"
+                    )
+                    flag = True
 
                 # sequentially evaluate (FK not batcherized)
                 for i in range(batch_size):
@@ -300,7 +335,7 @@ class EvaluatorWrapper:
                         betas_ = None
 
                     # we slice the output to the number of frames in the sequence, to remove the padding introduced in the padding_collate function
-                    instance_log = self.evaluate_from_prediction(
+                    instance_logs = self.evaluate_from_prediction(
                         local_rot[i][: num_frames[i]],
                         body_param[i],
                         head_motion[i][: num_frames[i]],
@@ -311,46 +346,57 @@ class EvaluatorWrapper:
                         betas=betas_,
                     )
 
-                    for key in instance_log:
-                        if key not in log:
-                            log[key] = (
-                                AverageValue()
-                                if not is_array_based_metric(key)
-                                else AccumulateArray()
-                            )
-                        log[key].add_value(instance_log[key])
+                    for skip, instance_log in instance_logs.items():
+                        log = logs_per_skip[skip]
+                        for key in instance_log:
+                            if key not in log:
+                                log[key] = (
+                                    AverageValue()
+                                    if not is_array_based_metric(key)
+                                    else AccumulateArray()
+                                )
+                            log[key].add_value(instance_log[key])
 
-                    metrics_list_to_csv = [
-                        instance_log[k]
-                        for k in log.keys()
-                        if not is_array_based_metric(k)
-                    ]
-                    fine_grained_results.append(
-                        [filenames[i], num_frames[i]] + metrics_list_to_csv
-                    )
-                    total_samples += 1
+                        metrics_list_to_csv = [
+                            instance_log[k]
+                            for k in log.keys()
+                            if not is_array_based_metric(k)
+                        ]
+                        fine_grained_per_skip[skip].append(
+                            [filenames[i], num_frames[i]] + metrics_list_to_csv
+                        )
 
-        df_titles = ["filename", "num_frames"] + [
-            k for k in log.keys() if not is_array_based_metric(k)
-        ]
-        fine_grained_df = pd.DataFrame(fine_grained_results, columns=df_titles)
+        results_per_skip = {}
+        for skip in self.eval_skip_frames:
+            log = logs_per_skip[skip]
+            df_titles = ["filename", "num_frames"] + [
+                k for k in log.keys() if not is_array_based_metric(k)
+            ]
+            fine_grained_df = pd.DataFrame(
+                fine_grained_per_skip[skip], columns=df_titles
+            )
+            arr_based_metrics = {}
+            summary_log = {}
+            for metric in log.keys():
+                if is_array_based_metric(metric):
+                    arr_based_metrics[metric] = log[metric].get_array()
+                else:
+                    summary_log[metric] = log[metric].get_average()
+            results_per_skip[skip] = (summary_log, fine_grained_df, arr_based_metrics)
 
-        arr_based_metrics = {}
-        summary_log = {}
-        for metric in log.keys():
-            if is_array_based_metric(metric):
-                # store plot + npy file with all values
-                arr_based_metrics[metric] = log[metric].get_array()
-            else:
-                summary_log[metric] = log[metric].get_average()
-
-        return summary_log, fine_grained_df, arr_based_metrics
+        return results_per_skip
 
     def store_all_results(self, df: pd.DataFrame, csv_path: Path):
         df.to_csv(csv_path, index=False)
         logger.info(f"Results successfully stored in a csv file: {csv_path=}")
 
-    def store_plots(self, metrics: dict, plot_dir: Path) -> dict:
+    def store_avg_results(self, log: dict, csv_path: Path):
+        """VR_Pose_Pred-style averaged-scalar CSV: two columns `metric, value`."""
+        rows = [[metric, f"{float(value):.2f}"] for metric, value in log.items()]
+        pd.DataFrame(rows, columns=["metric", "value"]).to_csv(csv_path, index=False)
+        logger.info(f"Avg results stored in: {csv_path=}")
+
+    def store_plots(self, metrics: dict, plot_dir: Path, suffix: str = "") -> dict:
         if len(metrics.keys()) == 0:
             return {}
 
@@ -381,7 +427,7 @@ class EvaluatorWrapper:
                 abs_max = max(max(y_values), abs_max)
                 plt.ylim([0, 1.1 * abs_max])
                 # store array to npz
-                filename = "arr_" + metric_name + ".npz"
+                filename = "arr_" + metric_name + suffix + ".npz"
                 np.savez(plot_dir / filename, values=metrics[metric_name])
                 saved_count += 1
                 if "gt" in metric_name:
@@ -395,7 +441,7 @@ class EvaluatorWrapper:
             plt.xlabel("Frame")
             plt.ylabel("Value")
 
-            tgt_path = plot_dir / (plot_cfg.filename + ".png")
+            tgt_path = plot_dir / (plot_cfg.filename + suffix + ".png")
             plt.savefig(tgt_path)
             plt.close()
             logger.info(f"'{title}' plot saved in {tgt_path}")

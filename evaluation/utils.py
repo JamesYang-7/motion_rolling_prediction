@@ -17,7 +17,7 @@ from utils.constants import DatasetType, SMPLGenderParam, SMPLModelType
 
 DATASETS_FPS = {
     DatasetType.AMASS_P1: 60,
-    DatasetType.AMASS_P2: 30,
+    DatasetType.AMASS_P2: 60,
     DatasetType.GORP: 30,
 }
 

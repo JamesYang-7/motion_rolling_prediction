@@ -228,9 +228,8 @@ class VisualizerWrapper:
             sparse.unsqueeze(0),
             return_predictions=export_results,
             body_model=self.body_model.get_body_model(
-                SMPLModelType.SMPLX, SMPLGenderParam.NEUTRAL
+                SMPLModelType.SMPLH, SMPLGenderParam.MALE
             ),
-            betas=gt_dict[DataTypeGT.SHAPE_PARAMS][0].unsqueeze(0),
             filenames=[
                 gt_dict[DataTypeGT.FILENAME],
             ],

@@ -252,9 +252,14 @@ class TrainLoop:
             eval_name = f"eval{suffix}"
             csv_path = self.save_dir, eval_name, f"results_{self.step+self.resume_step}.csv"
             start_eval = time.time()
-            log, all_results_df, _ = evaluator.evaluate_all()
-            evaluator.store_all_results(all_results_df, csv_path)
-            evaluator.push_to_tb(log, self.tb_writer, epoch, suffix=suffix)
+            results_per_skip = evaluator.evaluate_all()
+            # In-training eval: take the smallest skip (typically 0) for TB.
+            # Per-skip CSVs all share the same step index in the filename.
+            primary_skip = min(results_per_skip.keys())
+            for skip, (log_s, df_s, _) in sorted(results_per_skip.items()):
+                evaluator.store_all_results(df_s, csv_path)
+                if skip == primary_skip:
+                    evaluator.push_to_tb(log_s, self.tb_writer, epoch, suffix=suffix)
             end_eval = time.time()
             logger.info(
                 f"[{eval_name}] Evaluation time: {round(end_eval-start_eval)/60}min"

@@ -1,0 +1,15 @@
+torch==2.5.1
+torchvision
+torchaudio
+numpy
+matplotlib
+pandas
+tqdm
+loguru
+opencv-python
+trimesh
+pyrender
+PyOpenGL
+pyyaml
+tensorboard
+pillow
