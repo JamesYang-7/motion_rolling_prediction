@@ -101,6 +101,11 @@ def main():
             device,
             batch_size=args.eval_batch_size,
         )
+        if args.save_frames:
+            evaluator.save_frames_dir = output_dir / "frames"
+            logger.info(
+                f"Per-frame dump enabled — writing to {evaluator.save_frames_dir}"
+            )
         results_per_skip = evaluator.evaluate_all()
         for skip, (log, all_results_df, arr_based_metrics) in sorted(results_per_skip.items()):
             suffix = f"_skip{skip}f"

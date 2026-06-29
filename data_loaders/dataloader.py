@@ -431,6 +431,13 @@ class TestDataset(Dataset):
             self.tracking_gaps[idx] if self.tracking_gaps else None
         )
         gt_dict[DataTypeGT.FILENAME] = self.filename_list[idx]
+        # `data_dict['filepath']` is the original AMASS .npz path (e.g.
+        # "BioMotionLab_NTroje/rub098/0004_motorcycle_poses.npz") — matches
+        # entries in prepare_data/<dataset>/<group>/test_split.txt. The
+        # FILENAME field above is a slug derived from the dataset folder;
+        # both are kept since callers (eval_gap_config lookup, gap json
+        # keys) reference FILENAME and we don't want to break them.
+        gt_dict[DataTypeGT.FILEPATH] = data_dict.get("filepath", "")
         gt_dict[DataTypeGT.NUM_FRAMES] = data_dict[
             "hmd_position_global_full_gt_list"
         ].shape[0]

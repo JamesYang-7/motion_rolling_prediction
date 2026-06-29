@@ -10,10 +10,9 @@ import pandas as pd
 import torch
 from evaluation.utils import (
     BodyModelsWrapper,
-    get_body_poses,
+    get_body_poses_with_params,
     get_dataset_fps,
     get_GT_body_poses,
-    get_min_frames_to_eval,
 )
 
 from loguru import logger
@@ -34,10 +33,12 @@ from utils.metrics import (
     is_array_based_metric,
     keep_logging_metrics,
     MetricsInputData,
+    PER_FRAME_METRIC_FUNCS_DICT,
     remove_frames_to_gaps,
 )
 
 from pathlib import Path
+from typing import Optional
 
 def padding_collate(batch):
     """
@@ -118,6 +119,10 @@ class EvaluatorWrapper:
             eval_skip = [eval_skip]
         self.eval_skip_frames = list(eval_skip)
         self.batch_size = batch_size
+        # Per-frame body-parm + metric dump dir. None disables the dump (default).
+        # Set via `set_save_frames_dir(...)` from the test driver after the
+        # output dir has been resolved.
+        self.save_frames_dir: Optional[Path] = None
 
         # initialize data loader. Sorting the dataset by sequence length to
         # speed up the evaluation, as sequences with similar length will be
@@ -143,13 +148,20 @@ class EvaluatorWrapper:
         gt_gender: SMPLGenderParam,
         model_type: SMPLModelType,
         betas=None,
+        save_frame_idx: Optional[int] = None,
+        save_frame_filename: Optional[str] = None,
     ):
         """Run FK once, then compute metrics at every skip in self.eval_skip_frames.
 
         Returns dict[skip → eval_log]. Skips that exceed the sequence length
         (after the jitter T-3 guard) are silently dropped from the output.
+
+        When `self.save_frames_dir` is set and `save_frame_idx` is given, also
+        writes <save_frames_dir>/<save_frame_idx>.npz with predicted +
+        GT body parameters and per-frame metrics. The dump uses the full
+        sequence (no skip) so downstream callers can apply their own slice.
         """
-        pr_body = get_body_poses(
+        pr_body, pr_params = get_body_poses_with_params(
             output,
             self.body_model,
             head_motion,
@@ -205,7 +217,82 @@ class EvaluatorWrapper:
                         get_metric_function(metric)(metrics_input_data).cpu().numpy()
                     )
             eval_logs_per_skip[skip] = eval_log
+
+        if self.save_frames_dir is not None and save_frame_idx is not None:
+            self._dump_per_sequence_frames(
+                seq_idx=save_frame_idx,
+                filename=save_frame_filename or "",
+                pr_pos_full=pr_pos_full,
+                pr_angle_full=pr_angle_full,
+                pr_params=pr_params,
+                gt_pos_full=gt_pos_full,
+                gt_angle_full=gt_angle_full,
+                gt_params=body_param_GT,
+            )
         return eval_logs_per_skip
+
+    def _dump_per_sequence_frames(
+        self,
+        seq_idx: int,
+        filename: str,
+        pr_pos_full: torch.Tensor,
+        pr_angle_full: torch.Tensor,
+        pr_params: dict,
+        gt_pos_full: torch.Tensor,
+        gt_angle_full: torch.Tensor,
+        gt_params: dict,
+    ):
+        """Write a per-sequence .npz with predicted + GT body params and
+        per-frame metrics. File layout: <save_frames_dir>/<seq_idx>.npz with
+        flat `__`-separated keys (np.savez can't nest dicts):
+
+            pred__{root_orient,pose_body,trans,betas?}  (T, ...)
+            gt__{root_orient,pose_body,trans,betas?}    (T, ...)
+            frame_metrics__<metric>                     (T,) float32, NaN
+                                                        where undefined
+            filepath, seq_idx, T, fps                   scalars
+
+        Coefficients from `metrics_coeffs` are already applied so the metric
+        units match `avg_<dataset>_skip{N}f.csv` (deg / cm / cm·s⁻³).
+        `np.nanmean` over `frame_metrics__<m>` recovers the corresponding
+        scalar metric.
+        """
+        assert self.save_frames_dir is not None
+        self.save_frames_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build a MetricsInputData with full-sequence (no skip) FK outputs and
+        # run each registered per-frame metric in reduce_time=False mode.
+        metrics_input_data = MetricsInputData(
+            pred_positions=pr_pos_full,
+            pred_angles=pr_angle_full,
+            pred_mesh=None,  # mesh not needed by per-frame metrics
+            gt_positions=gt_pos_full,
+            gt_angles=gt_angle_full,
+            gt_mesh=None,
+            fps=self.fps,
+            trackingloss_masks=None,
+            gaps=None,
+        )
+        flat: dict = {
+            "filepath": np.array(filename),
+            "seq_idx": np.array(int(seq_idx)),
+            "T": np.array(int(pr_pos_full.shape[0])),
+            "fps": np.array(float(self.fps)),
+        }
+        for name, fn in PER_FRAME_METRIC_FUNCS_DICT.items():
+            v = fn(metrics_input_data, reduce_time=False)
+            flat[f"frame_metrics__{name}"] = v.detach().cpu().numpy().astype(np.float32)
+
+        for k, v in pr_params.items():
+            flat[f"pred__{k}"] = v.detach().cpu().numpy().astype(np.float32)
+        for k in ("root_orient", "pose_body", "trans", "betas"):
+            if k in gt_params:
+                v = gt_params[k]
+                if hasattr(v, "detach"):
+                    v = v.detach().cpu().numpy()
+                flat[f"gt__{k}"] = np.asarray(v).astype(np.float32)
+
+        np.savez(self.save_frames_dir / f"{seq_idx}.npz", **flat)
 
     def evaluate_single(self, sample_idx):
         gt_dict, cond_dict = self.dataset[sample_idx]
@@ -265,6 +352,9 @@ class EvaluatorWrapper:
         logs_per_skip = {skip: {} for skip in self.eval_skip_frames}
         fine_grained_per_skip = {skip: [] for skip in self.eval_skip_frames}
         flag = False
+        # Global sample counter so the per-frame dump (if enabled) writes one
+        # `<global_idx>.npz` per sequence regardless of batch boundaries.
+        global_sample_idx = 0
         with torch.no_grad():
             for i, (gt_dict, cond_dict) in tqdm(enumerate(self.data_loader)):
                 gt_data = gt_dict[DataTypeGT.RELATIVE_ROTS]
@@ -274,6 +364,13 @@ class EvaluatorWrapper:
                 gaps = gt_dict[DataTypeGT.TRACKING_GAP]
                 num_frames = gt_dict[DataTypeGT.NUM_FRAMES]
                 filenames = gt_dict[DataTypeGT.FILENAME]
+                # `filepaths` are the original AMASS .npz paths (e.g.
+                # "BioMotionLab_NTroje/rub098/0004_motorcycle_poses.npz")
+                # — what callers want stored in the per-frame dump so they
+                # can cross-reference with prepare_data/<dataset>/<group>/test_split.txt.
+                # Pre-fix dataset .pt files may not carry this key, so default
+                # to the slug to keep the dump non-empty.
+                filepaths = gt_dict.get(DataTypeGT.FILEPATH, filenames)
                 gt_genders = gt_dict[DataTypeGT.SMPL_GENDER]
                 model_types = gt_dict[DataTypeGT.SMPL_MODEL_TYPE]
                 bootstrap_data = gt_dict[DataTypeGT.BOOTSTRAP]
@@ -344,7 +441,10 @@ class EvaluatorWrapper:
                         gt_genders[i],
                         model_types[i],
                         betas=betas_,
+                        save_frame_idx=global_sample_idx,
+                        save_frame_filename=filepaths[i],
                     )
+                    global_sample_idx += 1
 
                     for skip, instance_log in instance_logs.items():
                         log = logs_per_skip[skip]

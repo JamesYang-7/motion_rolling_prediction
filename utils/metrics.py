@@ -30,13 +30,16 @@ class TrackingLossMasks:
 class MetricsInputData:
     pred_positions: th.Tensor
     pred_angles: th.Tensor
-    pred_mesh: th.Tensor
     gt_positions: th.Tensor
     gt_angles: th.Tensor
-    gt_mesh: th.Tensor
     fps: float
     trackingloss_masks: Optional[TrackingLossMasks]
     gaps: Optional[TrackingSignalGapsInfo]
+    # Mesh vertices are not consumed by any current metric — kept Optional so
+    # callers that don't already have FK mesh available (e.g. the per-frame
+    # dump) can omit them without paying for a redundant SMPL forward.
+    pred_mesh: Optional[th.Tensor] = None
+    gt_mesh: Optional[th.Tensor] = None
 
 
 class RestrictType(str, Enum):
@@ -61,6 +64,15 @@ METERS_TO_CENTIMETERS = 100.0
 RADIANS_TO_DEGREES = 360.0 / (2 * math.pi)  # 57.2958 grads
 REC_F_LENGTH = 3
 LOSS_F_LENGTH = 3
+
+
+def _prepend_nan(per_frame: th.Tensor, n: int) -> th.Tensor:
+    """Pad the front of a per-frame tensor with `n` NaN frames so velocity
+    (1 NaN at frame 0) and jitter (3 NaNs at frames 0..2) vectors share the
+    same length T as positional metrics. `np.nanmean` over the result
+    recovers the corresponding scalar metric."""
+    nan = th.full((n,), float("nan"), device=per_frame.device, dtype=per_frame.dtype)
+    return th.cat([nan, per_frame], dim=0)
 
 
 class AverageValue:
@@ -236,6 +248,8 @@ def jitter(
     target: str = "pred",
     joints: str = "all",
     restrict: RestrictType = RestrictType.NONE,
+    *,
+    reduce_time: bool = True,
 ):
     assert target in ["pred", "gt"], "target must be either pred or gt"
     assert joints in BODY_ENTITIES, f"unknown '{joints}' entity"
@@ -244,13 +258,18 @@ def jitter(
     jitter = (
         (motion[3:] - 3 * motion[2:-1] + 3 * motion[1:-2] - motion[:-3]) * (data.fps**3)
     ).norm(dim=2)
-    return restrict_and_mean(jitter, restrict, data.trackingloss_masks)
+    if reduce_time:
+        return restrict_and_mean(jitter, restrict, data.trackingloss_masks)
+    assert restrict == RestrictType.NONE, "per-frame jitter requires restrict=NONE"
+    return _prepend_nan(jitter.mean(dim=-1), 3)
 
 
 def mpjre(
     data: MetricsInputData,
     joints: str = "all",
     restrict: RestrictType = RestrictType.NONE,
+    *,
+    reduce_time: bool = True,
     **kwargs,
 ):
     assert joints in BODY_ENTITIES, f"unknown '{joints}' entity"
@@ -263,27 +282,37 @@ def mpjre(
     diff[diff > np.pi] = diff[diff > np.pi] - 2 * np.pi
     diff[diff < -np.pi] = diff[diff < -np.pi] + 2 * np.pi
     rot_error = th.absolute(diff)
-    result = restrict_and_mean(rot_error, restrict, data.trackingloss_masks)
-    return result * RADIANS_TO_DEGREES
+    if reduce_time:
+        result = restrict_and_mean(rot_error, restrict, data.trackingloss_masks)
+        return result * RADIANS_TO_DEGREES
+    assert restrict == RestrictType.NONE, "per-frame mpjre requires restrict=NONE"
+    return rot_error.mean(dim=-1) * RADIANS_TO_DEGREES
 
 
 def mpjpe(
     data: MetricsInputData,
     joints: str = "all",
     restrict: RestrictType = RestrictType.NONE,
+    *,
+    reduce_time: bool = True,
 ):
     assert joints in BODY_ENTITIES, f"unknown '{joints}' entity"
     predicted_position = data.pred_positions[..., BODY_ENTITIES[joints], :]
     gt_position = data.gt_positions[..., BODY_ENTITIES[joints], :]
     pos_error = th.sqrt(th.sum(th.square(gt_position - predicted_position), dim=-1))
-    result = restrict_and_mean(pos_error, restrict, data.trackingloss_masks)
-    return result * METERS_TO_CENTIMETERS
+    if reduce_time:
+        result = restrict_and_mean(pos_error, restrict, data.trackingloss_masks)
+        return result * METERS_TO_CENTIMETERS
+    assert restrict == RestrictType.NONE, "per-frame mpjpe requires restrict=NONE"
+    return pos_error.mean(dim=-1) * METERS_TO_CENTIMETERS
 
 
 def mpjve(
     data: MetricsInputData,
     joints: str = "all",
     restrict: RestrictType = RestrictType.NONE,
+    *,
+    reduce_time: bool = True,
 ):
     assert joints in BODY_ENTITIES, f"unknown '{joints}' entity"
     idx = BODY_ENTITIES[joints]
@@ -293,8 +322,29 @@ def mpjve(
     predicted_velocity = (pr_pos[1:] - pr_pos[:-1]) * data.fps
     vel_error = th.sqrt(th.sum(th.square(gt_velocity - predicted_velocity), dim=-1))
 
-    result = restrict_and_mean(vel_error, restrict, data.trackingloss_masks)
-    return result * METERS_TO_CENTIMETERS
+    if reduce_time:
+        result = restrict_and_mean(vel_error, restrict, data.trackingloss_masks)
+        return result * METERS_TO_CENTIMETERS
+    assert restrict == RestrictType.NONE, "per-frame mpjve requires restrict=NONE"
+    return _prepend_nan(vel_error.mean(dim=-1) * METERS_TO_CENTIMETERS, 1)
+
+
+def handpe_l(data: MetricsInputData, *, reduce_time: bool = True, **kwargs):
+    pe = th.sqrt(
+        th.sum(th.square(data.gt_positions[:, 20] - data.pred_positions[:, 20]), dim=-1)
+    )
+    if reduce_time:
+        return pe.mean() * METERS_TO_CENTIMETERS
+    return pe * METERS_TO_CENTIMETERS
+
+
+def handpe_r(data: MetricsInputData, *, reduce_time: bool = True, **kwargs):
+    pe = th.sqrt(
+        th.sum(th.square(data.gt_positions[:, 21] - data.pred_positions[:, 21]), dim=-1)
+    )
+    if reduce_time:
+        return pe.mean() * METERS_TO_CENTIMETERS
+    return pe * METERS_TO_CENTIMETERS
 
 
 METRIC_FUNCS_DICT = {
@@ -319,6 +369,54 @@ METRIC_FUNCS_DICT = {
 }
 
 ARRAY_BASED_METRICS = ["S_to_T_jerk", "T_to_S_jerk", "gt_S_to_T_jerk", "gt_T_to_S_jerk"]
+
+
+# Unit-conversion factors already baked into each scalar metric (e.g. mpjpe
+# returns cm). Mirrored from VR_Pose_Pred so downstream tools that consume the
+# per-frame .npz dumps know the unit of each column without re-deriving it.
+metrics_coeffs = {
+    "mpjre": RADIANS_TO_DEGREES,
+    "rootre": RADIANS_TO_DEGREES,
+    "upperre": RADIANS_TO_DEGREES,
+    "lowerre": RADIANS_TO_DEGREES,
+    "mpjpe": METERS_TO_CENTIMETERS,
+    "handpe": METERS_TO_CENTIMETERS,
+    "handpe_l": METERS_TO_CENTIMETERS,
+    "handpe_r": METERS_TO_CENTIMETERS,
+    "upperpe": METERS_TO_CENTIMETERS,
+    "lowerpe": METERS_TO_CENTIMETERS,
+    "rootpe": METERS_TO_CENTIMETERS,
+    "mpjve": METERS_TO_CENTIMETERS,
+    "upperve": METERS_TO_CENTIMETERS,
+    "lowerve": METERS_TO_CENTIMETERS,
+    "pred_jitter": 1.0,
+    "gt_jitter": 1.0,
+}
+
+
+# Per-frame metric registry. Superset of METRIC_FUNCS_DICT plus per-side
+# Hand-PE split (handpe_l / handpe_r). Each entry returns a (T,) tensor with
+# NaN at frames where the metric is undefined (frame 0 for VE, frames 0..2
+# for jitter). Coefficients are already applied — np.nanmean over the
+# returned vector recovers the corresponding scalar metric bit-for-bit.
+PER_FRAME_METRIC_FUNCS_DICT = {
+    "mpjre": partial(mpjre, joints="body"),
+    "rootre": partial(mpjre, joints="root"),
+    "upperre": partial(mpjre, joints="upper"),
+    "lowerre": partial(mpjre, joints="lower"),
+    "mpjpe": mpjpe,
+    "handpe": partial(mpjpe, joints="hands"),
+    "handpe_l": handpe_l,
+    "handpe_r": handpe_r,
+    "upperpe": partial(mpjpe, joints="upper"),
+    "lowerpe": partial(mpjpe, joints="lower"),
+    "rootpe": partial(mpjpe, joints="root"),
+    "mpjve": mpjve,
+    "upperve": partial(mpjve, joints="upper"),
+    "lowerve": partial(mpjve, joints="lower"),
+    "pred_jitter": partial(jitter, joints="all", target="pred"),
+    "gt_jitter": partial(jitter, joints="all", target="gt"),
+}
 
 
 @dataclass
@@ -448,6 +546,10 @@ def get_all_metrics():
 
 def get_all_metrics_trackingloss():
     return list(METRIC_FUNCS_DICT_TRACKING_LOSS.keys())
+
+
+def get_all_per_frame_metrics():
+    return list(PER_FRAME_METRIC_FUNCS_DICT.keys())
 
 
 def keep_logging_metrics(all_metrics: dict):

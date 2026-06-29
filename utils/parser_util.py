@@ -429,6 +429,15 @@ def add_sampling_options(parser):
     group.add_argument("--no_gt_init", action="store_true", help="Do not use GT for initialization.")
     group.add_argument("--bootstrap_data_path", type=Path, default=None,
                        help="Path to the bootstrap data file (used when --no_gt_init is set).")
+    group.add_argument(
+        "--save_frames",
+        action="store_true",
+        help="Dump per-sequence body params (pred + GT) and per-frame metrics "
+             "to <output_dir>/frames/<seq_idx>.npz. Mirrors VR_Pose_Pred's "
+             "--save-frames. Adds one np.savez write per sequence; gated off "
+             "by default since the dump is only needed for downstream "
+             "frame-level analysis tools.",
+    )
 
 
 def add_evaluation_options(parser):

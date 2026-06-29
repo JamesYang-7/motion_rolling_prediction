@@ -166,6 +166,25 @@ def get_body_poses(
     model_type: SMPLModelType,
     betas: Optional[torch.Tensor] = None,
 ):
+    predicted_body, _ = get_body_poses_with_params(
+        motion_pred, body_model, head_motion, device, gender, model_type, betas
+    )
+    return predicted_body
+
+
+def get_body_poses_with_params(
+    motion_pred: torch.Tensor,
+    body_model: BodyModelsWrapper,
+    head_motion: torch.Tensor,
+    device: str,
+    gender: SMPLGenderParam,
+    model_type: SMPLModelType,
+    betas: Optional[torch.Tensor] = None,
+):
+    """Same as `get_body_poses` but also returns the `body_params` dict
+    (`pose_body`, `root_orient`, `trans`, `betas?`) used as input to the
+    body model. Used by the per-sequence frame dump that writes the body
+    parameters out without re-running FK."""
 
     # ================ Pred (integrate HMD global motion) ==================
     motion_pred = motion_pred.to(device)
@@ -203,7 +222,7 @@ def get_body_poses(
         body_params["betas"] = betas
     predicted_body = body_model(body_params, model_type, gender)
 
-    return predicted_body
+    return predicted_body, body_params
 
 
 def get_dataset_fps(dataset_name):
