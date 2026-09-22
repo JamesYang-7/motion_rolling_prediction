@@ -106,6 +106,9 @@ def main():
         freerunning_frames=args.rolling_fr_frames,
         use_real_input=args.use_real_input,
         input_conf_threshold=args.input_conf_threshold,
+        mask_mode=args.mask_mode,
+        loss_hand_align=args.loss_hand_align,
+        hand_align_lag=args.hand_align_lag,
     )
     dataloader = get_dataloader(
         dataset,

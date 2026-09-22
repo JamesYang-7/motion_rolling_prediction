@@ -47,7 +47,8 @@ def load_model_wo_clip(model, state_dict):
 def create_model_and_rpm(args):
     model = RollingMDM(**get_model_args(args))
     rpm = create_rpm(args)
-    model = ModelWrapper(model, args.target_type, args.prediction_input_type, args.input_motion_length)
+    model = ModelWrapper(model, args.target_type, args.prediction_input_type, args.input_motion_length,
+                         sparse_canon_xy=bool(getattr(args, "sparse_canon_xy", False)))
     return model, rpm
 
 
@@ -65,6 +66,7 @@ def get_model_args(args):
         "ff_size": args.ff_size,
         "num_heads": args.num_heads,
         "activation": args.activation,
+        "learn_hand_offset": bool(getattr(args, "learn_hand_offset", False)),
     }
 
 
@@ -75,6 +77,7 @@ def create_rpm(args):
         args.cond_mask_prob,
         min_f=args.masker_minf,
         max_f=args.masker_maxf,
+        mask_mode=getattr(args, "mask_mode", "zero"),
     )
     return RollingPredictionModel(
         rolling_prediction_window=args.input_motion_length,
@@ -88,4 +91,6 @@ def create_rpm(args):
         loss_fk=args.loss_fk,
         loss_fk_vel=args.loss_fk_vel,
         support_dir=args.support_dir,
+        loss_hand_align=float(getattr(args, "loss_hand_align", 0.0)),
+        loss_lower_weight=float(getattr(args, "loss_lower_weight", 1.0)),
     )

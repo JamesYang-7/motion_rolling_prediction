@@ -27,11 +27,17 @@ class RollingMDM(nn.Module):
         dataset="amass",
         activation="gelu",
         sparse_dim=54,
+        learn_hand_offset=False,
         **kargs,
     ):
         super().__init__()
 
         self.nfeats = nfeats
+        if learn_hand_offset:
+            # learned rigid controller->wrist offset per hand, in the controller
+            # frame (hand-alignment loss; VR_Pose_Pred model_wrapper.hand_offset).
+            # Only created when enabled so released checkpoints still load.
+            self.hand_offset = nn.Parameter(torch.zeros(2, 3))
         self.dataset = dataset
 
         self.latent_dim = latent_dim

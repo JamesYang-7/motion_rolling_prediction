@@ -127,10 +127,46 @@ def add_losses_options(parser):
         type=float,
         help="Weighting of the loss applied to the velocity of the joints.",
     )
+    # --- portable tricks (VR_Pose_Pred research/progress.md §6 item 10); all off by default ---
+    group.add_argument(
+        "--loss_hand_align",
+        default=0.0,
+        type=float,
+        help="Weight of the soft hand-alignment loss: L1/L2 between the FK wrists and the (lagged) controller positions.",
+    )
+    group.add_argument(
+        "--hand_align_lag",
+        default=0.0,
+        type=float,
+        help="Frames in the past the hand-alignment target is read at (fractional = linear interpolation).",
+    )
+    group.add_argument(
+        "--loss_lower_weight",
+        default=1.0,
+        type=float,
+        help="Weight of the lower-body joints in loss_fk / loss_fk_vel.",
+    )
 
 
 def add_model_options(parser):
     group = parser.add_argument_group("model")
+    # --- portable tricks; in the 'model' group so test.py restores them from args.json ---
+    group.add_argument(
+        "--sparse_canon_xy",
+        action="store_true",
+        help="Subtract the current frame's head xy from every position channel of the sparse window.",
+    )
+    group.add_argument(
+        "--mask_mode",
+        default="zero",
+        choices=["zero", "hold"],
+        help="What a masked hand block becomes (confidence mask at train+eval, train masker segments): zeros or the last observed hand held.",
+    )
+    group.add_argument(
+        "--learn_hand_offset",
+        action="store_true",
+        help="Learn a rigid controller->wrist offset per hand for the hand-alignment loss.",
+    )
     group.add_argument(
         "--masker",
         default=ConditionMasker.SEG_HANDS_IDP,

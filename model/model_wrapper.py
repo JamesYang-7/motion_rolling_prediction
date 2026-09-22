@@ -10,10 +10,27 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 from utils.constants import (
+    DataTypeGT,
     ModelOutputType,
     PredictionInputType,
     PredictionTargetType,
+    sparse_point_slices,
 )
+
+
+def canonicalize_sparse_xy(sparse: th.Tensor) -> th.Tensor:
+    """Subtract the window's last (= current) frame's head xy from the xy of
+    every present position block (head, both hands); rotations and velocities
+    untouched. Port of VR_Pose_Pred model_wrapper._canonicalize_xy. A zeroed
+    (confidence-masked) hand block must stay zero, hence the presence test."""
+    head_pos = sparse_point_slices(0)[2]
+    ref = sparse[:, -1:, head_pos.start : head_pos.start + 2]  # (B, 1, 2)
+    sparse = sparse.clone()
+    for k in range(3):
+        sl = sparse_point_slices(k)[2]
+        present = (sparse[..., sl].abs().sum(-1, keepdim=True) > 0).to(sparse.dtype)
+        sparse[..., sl.start : sl.start + 2] = sparse[..., sl.start : sl.start + 2] - ref * present
+    return sparse
 
 ALL_FUNCTIONS = {
     PredictionTargetType.PCAF_COSINE: lambda num_timesteps: [
@@ -38,8 +55,10 @@ class ModelWrapper(nn.Module):
         target_type: PredictionTargetType,
         prediction_input_type: PredictionInputType,
         prediction_length: int,
+        sparse_canon_xy: bool = False,
     ):
         super().__init__()
+        self.sparse_canon_xy = sparse_canon_xy
         self.target_type = target_type
         self.prediction_input_type = prediction_input_type
         self.model = model
@@ -98,6 +117,9 @@ class ModelWrapper(nn.Module):
         else:
             raise NotImplementedError
 
+        if self.sparse_canon_xy:
+            cond = dict(cond)
+            cond[DataTypeGT.SPARSE] = canonicalize_sparse_xy(cond[DataTypeGT.SPARSE])
         model_output = self.model(model_input.float(), cond, **kwargs)
         assert isinstance(model_output, dict), "model output must be a dict"
         assert (

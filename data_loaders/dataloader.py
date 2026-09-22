@@ -24,6 +24,120 @@ from utils.constants import (
     SMPLModelType,
 )
 from pathlib import Path
+from utils.utils_transform import matrot2sixd, sixd2matrot
+
+
+# ---------------------------------------------------------------------------
+# Portable tricks (VR_Pose_Pred research/progress.md §6 item 10): hold masking
+# of confidence-masked hands and the lagged controller targets of the
+# hand-alignment loss. Off unless --mask_mode hold / --loss_hand_align > 0.
+# ---------------------------------------------------------------------------
+def hold_hand_block(sp: torch.Tensor, valid: torch.Tensor, k: int) -> None:
+    """Hold masking of hand k (1 left, 2 right) in place; port of
+    VR_Pose_Pred dataloader/dataloader.py:_hold_mask_block.
+
+    `sp` (T, 54), `valid` (T,) bool. Frames with valid=False that have an
+    earlier valid frame get rot / pos copied from the last valid frame,
+    rotvel = identity, posvel = 0. The first valid frame after a held run
+    gets rotvel = inv(R_held) @ R_now and posvel = pos_now - pos_held (the
+    true jump from the last seen hand). Frames before the first valid frame
+    are left as they are (the caller zeroes them)."""
+    rot_s, rotvel_s, pos_s, posvel_s = constants.sparse_point_slices(k)
+    T = sp.shape[0]
+    idx = torch.arange(T)
+    last = torch.where(valid, idx, torch.full_like(idx, -1)).cummax(dim=0).values
+    held = (~valid) & (last >= 0)
+    if held.any():
+        src = last[held]
+        sp[held, rot_s] = sp[src, rot_s]
+        sp[held, pos_s] = sp[src, pos_s]
+        sp[held, rotvel_s] = torch.tensor(constants.IDENTITY_6D, dtype=sp.dtype)
+        sp[held, posvel_s] = 0.0
+    regained = valid.clone()
+    regained[0] = False
+    regained[1:] &= held[:-1]
+    if regained.any():
+        prev = torch.nonzero(regained).squeeze(1) - 1
+        R_prev = sixd2matrot(sp[prev, rot_s])
+        R_now = sixd2matrot(sp[regained, rot_s])
+        sp[regained, rotvel_s] = matrot2sixd(torch.matmul(R_prev.transpose(1, 2), R_now)).to(sp.dtype)
+        sp[regained, posvel_s] = sp[regained, pos_s] - sp[prev, pos_s]
+
+
+def hold_segment(sp: torch.Tensor, t0: int, t1: int, k: int) -> None:
+    """Hold-masking form of a train-time masker segment [t0, t1) of hand k
+    on one window `sp` (n, 54): same rule as `hold_hand_block` with frame
+    t0-1 as the last valid frame; a segment starting at frame 0 has no
+    earlier frame and is zeroed instead (a leading gap)."""
+    n = sp.shape[0]
+    rot_s, rotvel_s, pos_s, posvel_s = constants.sparse_point_slices(k)
+    if t0 <= 0:
+        for s in (rot_s, rotvel_s, pos_s, posvel_s):
+            sp[t0:t1, s] = 0.0
+        return
+    sp[t0:t1, rot_s] = sp[t0 - 1, rot_s]
+    sp[t0:t1, pos_s] = sp[t0 - 1, pos_s]
+    sp[t0:t1, rotvel_s] = torch.tensor(constants.IDENTITY_6D, dtype=sp.dtype, device=sp.device)
+    sp[t0:t1, posvel_s] = 0.0
+    if t1 < n:
+        R_prev = sixd2matrot(sp[t0 - 1 : t0, rot_s])
+        R_now = sixd2matrot(sp[t1 : t1 + 1, rot_s])
+        sp[t1, rotvel_s] = matrot2sixd(torch.matmul(R_prev.transpose(1, 2), R_now))[0].to(sp.dtype)
+        sp[t1, posvel_s] = sp[t1, pos_s] - sp[t0 - 1, pos_s]
+
+
+def lag_sequence(x: torch.Tensor, lag: float) -> torch.Tensor:
+    """x read `lag` frames in the past along dim 0 (linear interpolation for
+    fractional lags, frame 0 repeated at the start); port of VR_Pose_Pred
+    train.py:lag_sparse. GORP's real tracking runs ~0.75 frame ahead of the
+    mocap, so the hand-alignment target is read slightly in the past."""
+    if lag <= 0.0:
+        return x
+    k = int(lag)
+    f = lag - k
+
+    def back(n):
+        if n == 0:
+            return x
+        return torch.cat([x[:1].expand(n, *x.shape[1:]), x[:-n]], dim=0)
+
+    out = back(k)
+    if f > 0.0:
+        out = (1.0 - f) * out + f * back(k + 1)
+    return out
+
+
+def _hand_confidence_masks(data_dict, input_conf_threshold: float, T: int):
+    """(left, right) bool (T,) confidence-pass masks of the real input."""
+    out = []
+    for key in ("left_hand_confidence", "right_hand_confidence"):
+        conf = torch.as_tensor(data_dict[key]).float()[:T]
+        out.append(conf >= input_conf_threshold)
+    return out
+
+
+def hand_alignment_gt(data_dict, use_real_input: bool, input_conf_threshold: float, lag: float):
+    """Per-frame targets of the hand-alignment loss for a whole sequence:
+    HAND_TARGET (T, 2, 3) controller positions, HAND_ROT (T, 2, 6) controller
+    rotations (for the learned rigid offset), HAND_VALID (T, 2) 1 where the
+    confidence passed, all read `lag` frames in the past. A fractional lag
+    mixes two frames, so validity requires both to be observed. Built from
+    the raw (unmasked) signal, so independent of --mask_mode."""
+    field = "hmd_position_global_full_real_list" if use_real_input else "hmd_position_global_full_gt_list"
+    raw = data_dict[field].float()
+    T = raw.shape[0]
+    pos = torch.stack([raw[:, constants.sparse_point_slices(k)[2]] for k in (1, 2)], dim=1)   # (T, 2, 3)
+    rot = torch.stack([raw[:, constants.sparse_point_slices(k)[0]] for k in (1, 2)], dim=1)   # (T, 2, 6)
+    if use_real_input and input_conf_threshold > 0.0:
+        valid = torch.stack(_hand_confidence_masks(data_dict, input_conf_threshold, T), dim=1).float()
+    else:
+        valid = torch.ones(T, 2)
+    return {
+        DataTypeGT.HAND_TARGET: lag_sequence(pos, lag),
+        DataTypeGT.HAND_ROT: lag_sequence(rot, lag),
+        DataTypeGT.HAND_VALID: (lag_sequence(valid, lag) > 0.999).float(),
+    }
+
 
 @dataclass
 class DatasetDataStruct:
@@ -47,6 +161,7 @@ def parse_data_struct(
     keys_to_parse: Set[DataTypeGT],
     use_real_input=False,
     input_conf_threshold=0.0,
+    mask_mode="zero",
 ):
     """
     Parse the data structure to get the gt_dict and cond_dict used
@@ -63,13 +178,21 @@ def parse_data_struct(
         assert "hmd_position_global_full_real_list" in data_dict, "No real input found"
         assert "left_hand_confidence" in data_dict, "No left-hand-conf found"
         assert "right_hand_confidence" in data_dict, "No right-hand-conf found"
-        sparse = data_dict["hmd_position_global_full_real_list"]  # [seq_len, 54]
+        # clone: the stored sequence stays raw (the hand-alignment targets and
+        # the hold rule read it), instead of upstream's in-place zeroing
+        sparse = data_dict["hmd_position_global_full_real_list"].clone()  # [seq_len, 54]
         lhand_idces = constants.ENTITIES_IDCES[DatasetType.GORP][1]  # [seq_len]
         rhand_idces = constants.ENTITIES_IDCES[DatasetType.GORP][2]  # [seq_len]
-        left_mask = data_dict["left_hand_confidence"] >= input_conf_threshold
-        right_mask = data_dict["right_hand_confidence"] >= input_conf_threshold
-        sparse[:, lhand_idces] = sparse[:, lhand_idces] * left_mask[:, None]
-        sparse[:, rhand_idces] = sparse[:, rhand_idces] * right_mask[:, None]
+        left_mask, right_mask = _hand_confidence_masks(data_dict, input_conf_threshold, sparse.shape[0])
+        # below-threshold hand block -> zeros (RPM's rule) ...
+        sparse[:, lhand_idces] = sparse[:, lhand_idces] * left_mask[:, None].to(sparse.dtype)
+        sparse[:, rhand_idces] = sparse[:, rhand_idces] * right_mask[:, None].to(sparse.dtype)
+        if mask_mode == "hold":
+            # ... or the last observed hand frozen in place (leading gaps stay zero)
+            hold_hand_block(sparse, left_mask, 1)
+            hold_hand_block(sparse, right_mask, 2)
+        elif mask_mode != "zero":
+            raise ValueError(f"mask_mode must be zero|hold, got {mask_mode!r}")
         cond_dict[DataTypeGT.SPARSE] = sparse
 
     if DataTypeGT.GLOBAL_ROTS and "rotation_global_full_gt_list" in data_dict:
@@ -123,6 +246,7 @@ class TrainDataset(Dataset):
         no_normalization: bool = False,
         use_real_input: bool = False,
         input_conf_threshold: float = 0.0,
+        mask_mode: str = "zero",
         **kwargs,
     ):
         self.dataset = dataset
@@ -132,14 +256,16 @@ class TrainDataset(Dataset):
         self.std[abs(self.std) < 1e-6] = (
             1.0  # if std is 0 --> set it to 1 (value will be set to 0 after normalization)
         )
-        self.mean_gpu = dataset_data.mean.to("cuda:0")
-        self.std_gpu = dataset_data.std.to("cuda:0")
+        _dev = "cuda:0" if torch.cuda.is_available() else "cpu"  # --cpu smoke tests
+        self.mean_gpu = dataset_data.mean.to(_dev)
+        self.std_gpu = dataset_data.std.to(_dev)
         self.filename_list = dataset_data.filename_list
         self.train_dataset_repeat_times = train_dataset_repeat_times
         self.no_normalization = no_normalization
         self.input_motion_length = input_motion_length
         self.use_real_input = use_real_input
         self.input_conf_threshold = input_conf_threshold
+        self.mask_mode = mask_mode
 
     def __len__(self):
         return len(self.data) * self.train_dataset_repeat_times
@@ -168,7 +294,7 @@ class TrainDataset(Dataset):
             DataTypeGT.SMPL_GENDER,
         }
         gt_dict, cond_dict = parse_data_struct(
-            data_dict, keys, self.use_real_input, self.input_conf_threshold
+            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode
         )
 
         seqlen = cond_dict[DataTypeGT.SPARSE].shape[0]
@@ -210,6 +336,9 @@ class OnlineTrainDataset(TrainDataset):
         latency: int = 0,  # access tu future 'latency' frames of sparse info
         use_real_input: bool = False,
         input_conf_threshold: float = 0.0,
+        mask_mode: str = "zero",
+        loss_hand_align: float = 0.0,
+        hand_align_lag: float = 0.0,
         **kwargs,
     ):
         super().__init__(
@@ -220,7 +349,10 @@ class OnlineTrainDataset(TrainDataset):
             no_normalization,
             use_real_input,
             input_conf_threshold,
+            mask_mode,
         )
+        self.hand_align = loss_hand_align > 0.0
+        self.hand_align_lag = hand_align_lag
         self.latency = latency
         self.freerunning_frames = freerunning_frames
         self.sparse_ctx_len = sparse_context
@@ -244,8 +376,11 @@ class OnlineTrainDataset(TrainDataset):
             DataTypeGT.SMPL_GENDER,
         }
         gt_dict, cond_dict = parse_data_struct(
-            data_dict, keys, self.use_real_input, self.input_conf_threshold
+            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode
         )
+        if self.hand_align:
+            # sliced below like every other (T, ...) gt tensor
+            gt_dict.update(hand_alignment_gt(data_dict, self.use_real_input, self.input_conf_threshold, self.hand_align_lag))
 
         seqlen = cond_dict[DataTypeGT.SPARSE].shape[0]
         if seqlen <= self.total_len:
@@ -299,6 +434,7 @@ class TestDataset(Dataset):
         use_real_input: bool = False,
         input_conf_threshold: float = 0.0,
         test_split: str = "test",
+        mask_mode: str = "zero",
         **kwargs,
     ):
         dataset_data = load_data(
@@ -314,6 +450,7 @@ class TestDataset(Dataset):
         self.no_normalization = no_normalization
         self.use_real_input = use_real_input
         self.input_conf_threshold = input_conf_threshold
+        self.mask_mode = mask_mode
 
         self.filename_list = []
         self.data = []
@@ -399,7 +536,7 @@ class TestDataset(Dataset):
             DataTypeGT.SMPL_GENDER,
         }
         gt_dict, cond_dict = parse_data_struct(
-            data_dict, keys, self.use_real_input, self.input_conf_threshold
+            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode
         )
         gt_dict[DataTypeGT.TRACKING_GAP] = (
             self.tracking_gaps[idx] if self.tracking_gaps else None

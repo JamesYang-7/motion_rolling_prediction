@@ -42,6 +42,7 @@ def main():
         use_real_input=args.use_real_input,
         input_conf_threshold=args.input_conf_threshold,
         test_split=args.test_split,
+        mask_mode=getattr(args, "mask_mode", "zero"),
     )
     logger.info("Loading model...")
     model, _ = load_rpm_model(args, device=device)

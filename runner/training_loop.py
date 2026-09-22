@@ -105,6 +105,7 @@ class TrainLoop:
                     eval_gap_config=eval_gap_config,
                     use_real_input=args.use_real_input,
                     input_conf_threshold=args.input_conf_threshold,
+                    mask_mode=getattr(args, "mask_mode", "zero"),
                 )
                 test_generator = create_generator(
                     args, model, test_dataset, device
@@ -267,7 +268,7 @@ def parse_resume_step_from_filename(filename):
     Parse filenames of the form path/to/modelNNNNNN.pt, where NNNNNN is the
     checkpoint's number of steps.
     """
-    split = filename.split("model")
+    split = str(filename).split("model")
     if len(split) < 2:
         return 0
     split1 = split[-1].split(".")[0]

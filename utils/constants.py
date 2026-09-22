@@ -19,6 +19,18 @@ INPUT_HEAD_IDCES = (36, 37, 38)
 INPUT_LHAND_IDCES = (39, 40, 41)
 INPUT_RHAND_IDCES = (42, 43, 44)
 
+# --- portable-tricks additions (VR_Pose_Pred research/progress.md §6 item 10) ---
+# SMPL joints weighted by --loss_lower_weight (VR_Pose_Pred utils/layouts.py lower_joints)
+LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
+IDENTITY_6D = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+
+
+def sparse_point_slices(k: int):
+    """(rot6d, rotvel6d, pos3, posvel3) slices of point k (0 head, 1 left hand,
+    2 right hand) in the 54-d sparse vector (ENTITIES_IDCES layout)."""
+    return (slice(6 * k, 6 * k + 6), slice(18 + 6 * k, 24 + 6 * k),
+            slice(36 + 3 * k, 39 + 3 * k), slice(45 + 3 * k, 48 + 3 * k))
+
 
 class DatasetType(str, Enum):
     DEFAULT = "default"
@@ -29,6 +41,7 @@ class DatasetType(str, Enum):
 
 class MotionLossType(str, Enum):
     LOSS = "LOSS"
+    HAND_ALIGN = "HAND_ALIGN"
     ROT_MSE = "ROT_MSE"
     VEL_MSE = "VEL_MSE"
     JOINTS_MSE = "JOINTS_MSE"
@@ -49,6 +62,12 @@ class DataTypeGT(str, Enum):
     FILENAME = "FILENAME"
     NUM_FRAMES = "NUM_FRAMES"
     SMPL_MODEL_TYPE = "SMPL_MODEL_TYPE"
+    # hand-alignment loss (train only): lagged controller position / rot6d /
+    # validity per hand, and the frames the train masker held
+    HAND_TARGET = "HAND_TARGET"
+    HAND_ROT = "HAND_ROT"
+    HAND_VALID = "HAND_VALID"
+    HAND_HELD = "HAND_HELD"
 
 
 class ModelOutputType(str, Enum):
