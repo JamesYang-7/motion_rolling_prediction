@@ -12,6 +12,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import re
 
 import time
 
@@ -50,6 +51,7 @@ class TrainLoop:
         self.lr = args.lr
         self.log_interval = args.log_interval
         self.save_interval = args.save_interval
+        self.keep_last_snapshots = int(getattr(args, "keep_last_snapshots", 0))
         self.resume_checkpoint = args.resume_checkpoint
         self.load_optimizer = args.load_optimizer
         self.use_fp16 = False
@@ -244,6 +246,23 @@ class TrainLoop:
                 torch.save(state_dict, f)
             with open(self.save_dir / "opt_latest.pt", "wb") as f:
                 torch.save(self.opt.state_dict(), f)
+        self._prune_snapshots()
+
+    def _prune_snapshots(self):
+        """--keep_last_snapshots N: delete all but the newest N numbered
+        model<step>.pt / opt<step>.pt pairs. Runs after the new pair is fully
+        written, so a crash mid-save still leaves the previous pair for
+        --resume_checkpoint (which needs the step in the file name)."""
+        if self.keep_last_snapshots <= 0:
+            return
+        steps = sorted(
+            int(m.group(1))
+            for p in self.save_dir.glob("model*.pt")
+            if (m := re.fullmatch(r"model(\d{9})\.pt", p.name))
+        )
+        for step in steps[: -self.keep_last_snapshots]:
+            for kind in ("model", "opt"):
+                (self.save_dir / f"{kind}{step:09d}.pt").unlink(missing_ok=True)
             
     def evaluate(self, epoch):
         if not self.args.eval_during_training:

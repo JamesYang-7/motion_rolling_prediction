@@ -402,6 +402,13 @@ def add_training_options(parser):
         help="Save checkpoints and run evaluation each N steps",
     )
     group.add_argument(
+        "--keep_last_snapshots",
+        default=0,
+        type=int,
+        help="Keep only the newest N numbered model<step>/opt<step> pairs (older ones are deleted "
+             "after each save; model_latest/opt_latest are always kept). 0 = keep all (upstream).",
+    )
+    group.add_argument(
         "--num_steps",
         default=100000,
         type=int,
