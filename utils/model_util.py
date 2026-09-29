@@ -48,7 +48,9 @@ def create_model_and_rpm(args):
     model = RollingMDM(**get_model_args(args))
     rpm = create_rpm(args)
     model = ModelWrapper(model, args.target_type, args.prediction_input_type, args.input_motion_length,
-                         sparse_canon_xy=bool(getattr(args, "sparse_canon_xy", False)))
+                         sparse_canon_xy=bool(getattr(args, "sparse_canon_xy", False)),
+                         sparse_canon_heading=getattr(args, "sparse_canon_heading", "none"),
+                         heading_ref_noise_deg=float(getattr(args, "heading_ref_noise_deg", 0.0)))
     return model, rpm
 
 

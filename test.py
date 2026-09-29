@@ -46,6 +46,10 @@ def main():
     )
     logger.info("Loading model...")
     model, _ = load_rpm_model(args, device=device)
+    # motion normalisation for heading canonicalisation (pelvis 6D is normalised)
+    model.set_motion_normalization(
+        None if args.no_normalization else dataset.mean, None if args.no_normalization else dataset.std
+    )
 
     exp_name = args.model_path.parts[-2]
     checkpoint_name = args.model_path.parts[-1].split(".")[0]

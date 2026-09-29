@@ -157,6 +157,20 @@ def add_model_options(parser):
         help="Subtract the current frame's head xy from every position channel of the sparse window.",
     )
     group.add_argument(
+        "--sparse_canon_heading",
+        default="none",
+        choices=["none", "pelvis"],
+        help="Rotate every world-frame input about the vertical axis so the pelvis yaw of the last "
+             "motion-context frame faces +x; the predicted pelvis orientation is rotated back "
+             "(needs --sparse_canon_xy).",
+    )
+    group.add_argument(
+        "--heading_ref_noise_deg",
+        default=0.0,
+        type=float,
+        help="Std (degrees) of Gaussian yaw noise on the heading reference, training only.",
+    )
+    group.add_argument(
         "--mask_mode",
         default="zero",
         choices=["zero", "hold"],

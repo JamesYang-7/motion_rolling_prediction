@@ -31,6 +31,11 @@ def train_rpm(args, dataloader, device="cuda"):
     args.num_workers = args.num_workers * num_gpus
 
     model, rpm = create_model_and_rpm(args)
+    # motion normalisation for heading canonicalisation (pelvis 6D is normalised)
+    ds = dataloader.dataset
+    model.set_motion_normalization(
+        None if args.no_normalization else ds.mean, None if args.no_normalization else ds.std
+    )
 
     if num_gpus > 1 and device != "cpu":
         logger.info("Let's use", torch.cuda.device_count(), "GPUs!")
