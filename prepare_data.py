@@ -199,6 +199,12 @@ def main(args, device="cuda:0"):
                 bdata_poses = bdata["poses"][downsamp_inds, ...]
                 bdata_trans = bdata["trans"][downsamp_inds, ...]
                 smpl_gender = bdata["gender"]
+                # AMASS stores gender as a 0-d numpy array (<U4 / bytes); the
+                # SMPLGenderParam lookup below needs a plain str.
+                if isinstance(smpl_gender, np.ndarray):
+                    smpl_gender = smpl_gender.item()
+                if isinstance(smpl_gender, bytes):
+                    smpl_gender = smpl_gender.decode()
 
                 body_parms = {
                     "root_orient": torch.Tensor(
