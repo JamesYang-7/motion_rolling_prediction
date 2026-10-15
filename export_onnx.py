@@ -5,8 +5,31 @@ opset 15, float32, batch 1, no Einsum node, eager and onnxruntime replays
 checked against the eval's own rollout, and a manifest.json (provenance, IO
 contract, normalisation, checks) next to the graph.
 
-    checkpoints/<folder>/<exp>/model_latest.pt  (+ args.json)
- -> checkpoints/<folder>/<exp>/export/rpm_<folder>_<exp>.onnx + manifest.json
+    checkpoints/<folder>/<exp>/model_latest.pt  (+ args.json)  ->  <name> = <folder>_<exp>
+
+Export tree (default `export/` at the repo root, gitignored; float32 .npz
+arrays only), the layout of VR_Pose_Pred's export:
+
+    RPM-README.md                   copy of docs/RPM-README.md               (common)
+    data/<dataset>/<stem>.npz       one per GORP test_controllers capture, model-independent:
+        sparse_raw                  (T+1, 3, 8) raw GORP device stream, per device
+                                    [px py pz qw qx qy qz valid] (head, L, R controller;
+                                    GORP's Y-up frame, head valid = 1)
+        gt_motion                   (T, 198) mocap: 22 local rot 6D + 22 world joint pos
+        joints_rest                 (22, 3)  the subject's SMPL-X rest joints (betas)
+    models/<name>/                  one per checkpoint
+        rpm_<name>.onnx             one rolling step (contract below)
+        manifest.json               provenance, IO contract, loop, normalisation, checks
+        output_ref/<stem>.npz       this checkpoint's reference for data/<dataset>/<stem>.npz:
+            sparse_ctx              (T, 54)  the input as the loader feeds it (real input
+                                    zero-masked below the confidence threshold, or the
+                                    synthetic input from the mocap body)
+            ref_pred_motion         (T, 198) rows 0 .. 9 = gt_motion (the eval's seed), then
+                                    the eager graph's motion_out (rot 6D = RPM's rollout)
+
+A data file that already exists (from an earlier export) is checked against
+the new arrays and kept; a mismatch stops the export. The README is
+rewritten on every export.
 
 The step graph is ModelWrapper (network + PCAF blend) plus what the rolling
 generator (evaluation/generators.py) and the eval (evaluation/utils.py
@@ -38,15 +61,18 @@ graph with the eval's seed, and score the replays with EvaluatorWrapper's
 metric code. AMASS checkpoints are replayed on the same GORP captures with
 their own normalisation: a numeric check only, no metrics.
 
-Usage (from the repo root, RPM's own .venv):
-    TQDM_DISABLE=1 .venv/Scripts/python.exe export_onnx.py
-    TQDM_DISABLE=1 .venv/Scripts/python.exe export_onnx.py \
+Usage (from the repo root, RPM's own .venv; raw GORP root via --gorp_raw_dir
+or the GORP_RAW_DIR environment variable):
+    TQDM_DISABLE=1 .venv/Scripts/python.exe export_onnx.py --gorp_raw_dir E:/Data/GORP
+    TQDM_DISABLE=1 .venv/Scripts/python.exe export_onnx.py --gorp_raw_dir E:/Data/GORP \
         --model_paths ./checkpoints/gorp_real_inputs/reactive/model_latest.pt
 """
 
 import argparse
 import collections
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -78,6 +104,8 @@ from utils.parser_util import sample_args
 from utils.utils_transform import sixd2aa
 
 REPO = Path(__file__).resolve().parent
+DATA_KEYS = ("sparse_raw", "gt_motion", "joints_rest")      # data/<dataset>/<stem>.npz
+OUTPUT_REF_KEYS = ("sparse_ctx", "ref_pred_motion")       # models/<name>/output_ref/<stem>.npz
 HEAD_POS = sparse_point_slices(0)[2]
 INPUT_NAMES = ["sparse_ctx", "motion_ctx", "prev_pred", "joints_rest"]
 OUTPUT_NAMES = ["motion_out", "joint_rotmat", "next_motion_ctx", "next_prev_pred"]
@@ -242,6 +270,37 @@ def git_commit():
         return ""
 
 
+def raw_device_stream(raw_path, n_expected):
+    """(N, 3, 8) float32 from a raw GORP capture: per device pos + wxyz quat +
+    valid, the frames prepare_data_gorp.py reads (30 fps, no resample; head
+    valid = 1). Asserts N = processed length + 1 (frame 0 only seeds the
+    velocities). Same as VR_Pose_Pred's export_app_bundle.raw_device_stream."""
+    tr = np.load(raw_path, allow_pickle=True)["tracking_data"].item()
+    n = tr["hmdTransforms"].shape[0]
+    assert n == n_expected + 1, f"{raw_path}: {n} raw frames vs {n_expected} processed"
+    out = np.zeros((n, 3, 8), np.float32)
+    for k, (pose, valid) in enumerate((("hmdTransforms", None), ("lConTransforms", "lConValid"),
+                                       ("rConTransforms", "rConValid"))):
+        out[:, k, :7] = np.asarray(tr[pose], np.float32)
+        out[:, k, 7] = 1.0 if valid is None else np.asarray(tr[valid], np.float32)
+    return out
+
+
+def write_data_file(path, arrays):
+    """Write the model-independent capture file, or check an existing one
+    (written by another checkpoint's export) against `arrays` and keep it."""
+    if path.exists():
+        old = np.load(path)
+        diff = {k: (float(np.abs(old[k] - arrays[k]).max()) if k in old.files and old[k].shape == arrays[k].shape
+                    else float("inf")) for k in arrays}
+        if set(old.files) != set(arrays) or max(diff.values()) > 1e-5:
+            raise RuntimeError(f"{path} exists with different content (max |diff| per key {diff}); "
+                               "delete it to rebuild, or export under another --dataset_name")
+        return "kept"
+    np.savez(path, **arrays)
+    return "written"
+
+
 def input_description(args, train_args, fps):
     if args.dataset == DatasetType.GORP and train_args.get("use_real_input", False):
         return (f"GORP real device input at {fps} fps (RPM prepare_data_gorp.py + "
@@ -256,8 +315,11 @@ def input_description(args, train_args, fps):
 
 def export_one(model_path, cli):
     folder, exp = model_path.parent.parent.name, model_path.parent.name
-    name = f"rpm_{folder}_{exp}"
-    out_dir = model_path.parent / "export"
+    model_name = f"{folder}_{exp}"
+    name = f"rpm_{model_name}"
+    out_dir = cli.out / "models" / model_name
+    data_dir = cli.out / "data" / cli.dataset_name
+    ref_dir = out_dir / "output_ref"
     args, train_args = load_args(model_path)
     assert args.rolling_latency == 0, "the step graph is written for rolling_latency 0"
     m_ctx, s_ctx, L = args.rolling_motion_ctx, args.rolling_sparse_ctx, args.input_motion_length
@@ -267,7 +329,8 @@ def export_one(model_path, cli):
 
     model, _ = load_rpm_model(args, device="cpu")
     model.eval()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    for d in (out_dir, data_dir, ref_dir):
+        d.mkdir(parents=True, exist_ok=True)
     mean, std = motion_stats(args)
     use_real = bool(train_args.get("use_real_input", False)) and args.dataset == DatasetType.GORP
     conf = float(train_args.get("input_conf_threshold", 0.0)) if use_real else 0.0
@@ -296,7 +359,8 @@ def export_one(model_path, cli):
             joints_rest = body_model({"root_orient": torch.zeros(1, 3), "pose_body": torch.zeros(1, 63),
                                       "betas": betas[:1]}, SMPLModelType.SMPLX, gender).Jtr[0, :NUM_JOINTS_SMPL]
         seqs.append(dict(source=seq, idx=idx, gt_dict=gt_dict, gt=gt, sparse=cond_dict[DataTypeGT.SPARSE].float(),
-                         gt_norm=ds.transform(gt).float(), betas=betas, gender=gender, joints_rest=joints_rest.float()))
+                         gt_norm=ds.transform(gt).float(), betas=betas, gender=gender, joints_rest=joints_rest.float(),
+                         stem=Path(seq).stem))
 
     onnx_path = out_dir / f"{name}.onnx"
     s0 = seqs[0]
@@ -310,6 +374,7 @@ def export_one(model_path, cli):
     op_counts = collections.Counter(n.op_type for n in onnx_model.graph.node)
     assert op_counts.get("Einsum", 0) == 0, \
         f"{op_counts['Einsum']} Einsum node(s) in the export; Unity Inference Engine mis-evaluates them"
+    n_weights = int(sum(np.prod(t.dims) for t in onnx_model.graph.initializer))
     del onnx_model
     size_mib = onnx_path.stat().st_size / 2 ** 20
     logger.info(f"wrote {onnx_path} ({size_mib:.1f} MiB, opset {cli.opset}, {sum(op_counts.values())} nodes, no Einsum)")
@@ -368,7 +433,23 @@ def export_one(model_path, cli):
         head_err = float(np.abs(eager[:, 132 + 3 * HEAD_JOINT_IDX:135 + 3 * HEAD_JOINT_IDX]
                                 - s["sparse"][margin:, HEAD_POS].numpy()).max())
         checks["head_joint_vs_tracked_head_max_abs_m"] = max(checks["head_joint_vs_tracked_head_max_abs_m"], head_err)
-        rec = {"source": s["source"], "test_index": s["idx"], "frames": int(len(ref_rot)), "replayed_steps": int(len(eager))}
+        # ---- reference files: the capture (model-independent) and this checkpoint's input / output ----
+        T_len = len(ref_rot)
+        gt_pos = s["gt_dict"][DataTypeGT.WORLD_JOINTS][:, :NUM_JOINTS_SMPL].reshape(T_len, -1).float()
+        gt_motion = torch.cat([s["gt"], gt_pos], dim=-1).numpy()
+        arrays = {
+            "sparse_raw": raw_device_stream(cli.gorp_raw_dir / s["source"], T_len),
+            "gt_motion": gt_motion,
+            "joints_rest": s["joints_rest"].numpy(),
+            "sparse_ctx": s["sparse"].numpy(),
+            "ref_pred_motion": np.concatenate([gt_motion[:margin], eager]),   # rows < margin = the eval's GT seed
+        }
+        assert all(a.dtype == np.float32 for a in arrays.values()) and arrays["ref_pred_motion"].shape == gt_motion.shape
+        data_state = write_data_file(data_dir / f"{s['stem']}.npz", {k: arrays[k] for k in DATA_KEYS})
+        np.savez(ref_dir / f"{s['stem']}.npz", **{k: arrays[k] for k in OUTPUT_REF_KEYS})
+        rec = {"stem": s["stem"], "source": s["source"], "test_index": s["idx"], "frames": int(T_len),
+               "replayed_steps": int(len(eager)), "output_ref": f"output_ref/{s['stem']}.npz"}
+        logger.info(f"  {data_dir / (s['stem'] + '.npz')}: {data_state}")
         if evaluator is not None:
             gd = s["gt_dict"]
             for key, rot in (("rollout", ref_rot), ("onnxruntime_replay", torch.cat([ref_rot[:margin], torch.from_numpy(onnx_rows[:, :132])]))):
@@ -386,8 +467,12 @@ def export_one(model_path, cli):
 
     pcaf = ALL_FUNCTIONS[args.target_type](L)
     manifest = {
+        "name": model_name,
         "checkpoint": model_path.relative_to(REPO).as_posix(),
         "dataset": args.dataset.value, "exp_name": exp, "fps": fps,
+        "data_dir": f"../../data/{cli.dataset_name}",       # relative to this model's folder
+        "reference_input": ("GORP real device input, zero-masked as the model was trained"
+                            if use_real else "synthetic GORP input from the mocap body (hmd_position_global_full_gt_list)"),
         "input": input_description(args, train_args, fps),
         "use_real_input": use_real, "input_conf_threshold": conf,
         "target_type": str(args.target_type.value if hasattr(args.target_type, "value") else args.target_type),
@@ -421,10 +506,10 @@ def export_one(model_path, cli):
         ],
         "normalisation": {"motion_mean": [float(v) for v in mean.numpy()], "motion_std": [float(v) for v in std.numpy()]},
         "smplx_parents": parents,
-        "onnx": {"file": onnx_path.name, "opset": cli.opset, "size_mib": round(size_mib, 2),
+        "onnx": {"file": onnx_path.name, "opset": cli.opset, "size_mib": round(size_mib, 2), "weights": n_weights,
                  "op_types": dict(sorted(op_counts.items()))},
         "checks": dict(checks),
-        "check_sequences": seq_records,
+        "sequences": seq_records,
         "git_commit": git_commit(),
         "versions": {"torch": torch.__version__, "onnx": onnx.__version__, "onnxruntime": ort.__version__},
     }
@@ -438,11 +523,19 @@ def main():
     p.add_argument("--model_paths", nargs="+", type=Path, default=None,
                    help="model .pt files with an args.json beside them (default: every checkpoints/*/*/model_latest.pt)")
     p.add_argument("--sequences", nargs="+", default=list(DEFAULT_SEQUENCES),
-                   help="GORP test_controllers filepaths replayed for the checks")
+                   help="GORP test_controllers filepaths replayed for the checks and written as reference data")
+    p.add_argument("--out", type=Path, default=REPO / "export", help="export root (default: export/ in the repo)")
+    p.add_argument("--dataset_name", default="gorp", help="data folder under data/ the captures go to")
+    p.add_argument("--gorp_raw_dir", type=Path, default=os.environ.get("GORP_RAW_DIR"),
+                   help="raw GORP root holding GORP/<subject>/<capture>.npz (default: $GORP_RAW_DIR)")
     p.add_argument("--opset", type=int, default=15, help="ONNX opset (15 keeps Unity Sentis' supported range)")
     p.add_argument("--threads", type=int, default=4, help="torch / onnxruntime CPU threads")
     cli = p.parse_args()
+    assert cli.gorp_raw_dir is not None, "raw GORP root unknown: pass --gorp_raw_dir or set GORP_RAW_DIR"
+    cli.gorp_raw_dir = Path(cli.gorp_raw_dir)
     torch.set_num_threads(cli.threads)
+    cli.out.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(REPO / "docs" / "RPM-README.md", cli.out / "RPM-README.md")
     paths = cli.model_paths
     if paths is None:
         paths = sorted(p for p in (REPO / "checkpoints").glob("*/*/model_latest.pt") if (p.parent / "args.json").exists())
