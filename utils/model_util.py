@@ -80,6 +80,7 @@ def create_rpm(args):
         min_f=args.masker_minf,
         max_f=args.masker_maxf,
         mask_mode=getattr(args, "mask_mode", "zero"),
+        reappear_static=getattr(args, "reappear_static_frames", 0),
     )
     return RollingPredictionModel(
         rolling_prediction_window=args.input_motion_length,

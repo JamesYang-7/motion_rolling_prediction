@@ -64,26 +64,70 @@ def hold_hand_block(sp: torch.Tensor, valid: torch.Tensor, k: int) -> None:
         sp[regained, posvel_s] = sp[regained, pos_s] - sp[prev, pos_s]
 
 
-def hold_segment(sp: torch.Tensor, t0: int, t1: int, k: int) -> None:
+def hold_segment(sp: torch.Tensor, t0: int, t1: int, k: int, reappear_static: int = 0) -> None:
     """Hold-masking form of a train-time masker segment [t0, t1) of hand k
     on one window `sp` (n, 54): same rule as `hold_hand_block` with frame
-    t0-1 as the last valid frame; a segment starting at frame 0 has no
-    earlier frame and is zeroed instead (a leading gap)."""
+    t0-1 as the last valid frame; a segment with no seen frame before it
+    (starting at frame 0, or right after a hand that has not been tracked
+    yet, i.e. an all-zero block) is zeroed instead (a leading gap). With
+    `reappear_static` > 0 the frames after the segment then follow the
+    reappearance rule (`static_reappear_frames`). An empty segment (the
+    masker draws lengths from 0) loses no frame and changes nothing."""
     n = sp.shape[0]
+    if t1 <= t0:
+        return
     rot_s, rotvel_s, pos_s, posvel_s = constants.sparse_point_slices(k)
-    if t0 <= 0:
+    block = constants.ENTITIES_IDCES[DatasetType.GORP][k]
+    if t0 <= 0 or not bool((sp[t0 - 1, block] != 0).any()):
         for s in (rot_s, rotvel_s, pos_s, posvel_s):
             sp[t0:t1, s] = 0.0
-        return
-    sp[t0:t1, rot_s] = sp[t0 - 1, rot_s]
-    sp[t0:t1, pos_s] = sp[t0 - 1, pos_s]
-    sp[t0:t1, rotvel_s] = torch.tensor(constants.IDENTITY_6D, dtype=sp.dtype, device=sp.device)
-    sp[t0:t1, posvel_s] = 0.0
-    if t1 < n:
-        R_prev = sixd2matrot(sp[t0 - 1 : t0, rot_s])
-        R_now = sixd2matrot(sp[t1 : t1 + 1, rot_s])
-        sp[t1, rotvel_s] = matrot2sixd(torch.matmul(R_prev.transpose(1, 2), R_now))[0].to(sp.dtype)
-        sp[t1, posvel_s] = sp[t1, pos_s] - sp[t0 - 1, pos_s]
+    else:
+        sp[t0:t1, rot_s] = sp[t0 - 1, rot_s]
+        sp[t0:t1, pos_s] = sp[t0 - 1, pos_s]
+        sp[t0:t1, rotvel_s] = torch.tensor(constants.IDENTITY_6D, dtype=sp.dtype, device=sp.device)
+        sp[t0:t1, posvel_s] = 0.0
+        if t1 < n:
+            R_prev = sixd2matrot(sp[t0 - 1 : t0, rot_s])
+            R_now = sixd2matrot(sp[t1 : t1 + 1, rot_s])
+            sp[t1, rotvel_s] = matrot2sixd(torch.matmul(R_prev.transpose(1, 2), R_now))[0].to(sp.dtype)
+            sp[t1, posvel_s] = sp[t1, pos_s] - sp[t0 - 1, pos_s]
+    if reappear_static > 0 and t1 < n:
+        static_reappear_frames(sp, list(range(t1, min(t1 + reappear_static, n))), k)
+
+
+def static_reappear_frames(sp: torch.Tensor, frames, k: int) -> None:
+    """Reappearance rule on the given frames of hand k, in place: rotation
+    velocity -> identity, position velocity -> 0, pose untouched. Frames
+    whose hand block is all zero (a leading gap: the hand was never seen)
+    are skipped, as the rule only touches tracked frames."""
+    _, rotvel_s, _, posvel_s = constants.sparse_point_slices(k)
+    block = constants.ENTITIES_IDCES[DatasetType.GORP][k]
+    for t in frames:
+        if bool((sp[t, block] != 0).any()):
+            sp[t, rotvel_s] = torch.tensor(constants.IDENTITY_6D, dtype=sp.dtype, device=sp.device)
+            sp[t, posvel_s] = 0.0
+
+
+def static_reappear_block(sp: torch.Tensor, valid: torch.Tensor, k: int, n_frames: int) -> None:
+    """Reappearance rule (REAPPEAR_STATIC_FRAMES) of hand k over a whole
+    sequence, in place; port of VR_Pose_Pred dataloader/dataloader.py:
+    _static_reappear_block. On the first `n_frames` valid frames after an
+    invalid run (a leading gap included), rotvel -> identity and posvel -> 0;
+    rotation and position untouched. Removes the one-frame velocity spike a
+    returning hand carries (under zero masking the stored jump from the
+    tracker's placeholder, under hold the whole gap's displacement)."""
+    _, rotvel_s, _, posvel_s = constants.sparse_point_slices(k)
+    T = sp.shape[0]
+    regained = valid.clone()
+    regained[0] = False
+    regained[1:] &= ~valid[:-1]
+    hit = torch.zeros(T, dtype=torch.bool)
+    for j in range(n_frames):
+        hit[j:] |= regained[: T - j]
+    hit &= valid
+    if hit.any():
+        sp[hit, rotvel_s] = torch.tensor(constants.IDENTITY_6D, dtype=sp.dtype)
+        sp[hit, posvel_s] = 0.0
 
 
 def lag_sequence(x: torch.Tensor, lag: float) -> torch.Tensor:
@@ -162,6 +206,7 @@ def parse_data_struct(
     use_real_input=False,
     input_conf_threshold=0.0,
     mask_mode="zero",
+    reappear_static=0,
 ):
     """
     Parse the data structure to get the gt_dict and cond_dict used
@@ -193,6 +238,10 @@ def parse_data_struct(
             hold_hand_block(sparse, right_mask, 2)
         elif mask_mode != "zero":
             raise ValueError(f"mask_mode must be zero|hold, got {mask_mode!r}")
+        if reappear_static > 0:
+            # the first frame(s) a hand is tracked again carry no velocity
+            static_reappear_block(sparse, left_mask, 1, reappear_static)
+            static_reappear_block(sparse, right_mask, 2, reappear_static)
         cond_dict[DataTypeGT.SPARSE] = sparse
 
     if DataTypeGT.GLOBAL_ROTS and "rotation_global_full_gt_list" in data_dict:
@@ -247,6 +296,7 @@ class TrainDataset(Dataset):
         use_real_input: bool = False,
         input_conf_threshold: float = 0.0,
         mask_mode: str = "zero",
+        reappear_static: int = 0,
         **kwargs,
     ):
         self.dataset = dataset
@@ -266,6 +316,7 @@ class TrainDataset(Dataset):
         self.use_real_input = use_real_input
         self.input_conf_threshold = input_conf_threshold
         self.mask_mode = mask_mode
+        self.reappear_static = reappear_static
 
     def __len__(self):
         return len(self.data) * self.train_dataset_repeat_times
@@ -294,7 +345,8 @@ class TrainDataset(Dataset):
             DataTypeGT.SMPL_GENDER,
         }
         gt_dict, cond_dict = parse_data_struct(
-            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode
+            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode,
+            self.reappear_static,
         )
 
         seqlen = cond_dict[DataTypeGT.SPARSE].shape[0]
@@ -337,6 +389,7 @@ class OnlineTrainDataset(TrainDataset):
         use_real_input: bool = False,
         input_conf_threshold: float = 0.0,
         mask_mode: str = "zero",
+        reappear_static: int = 0,
         loss_hand_align: float = 0.0,
         hand_align_lag: float = 0.0,
         **kwargs,
@@ -350,6 +403,7 @@ class OnlineTrainDataset(TrainDataset):
             use_real_input,
             input_conf_threshold,
             mask_mode,
+            reappear_static,
         )
         self.hand_align = loss_hand_align > 0.0
         self.hand_align_lag = hand_align_lag
@@ -376,7 +430,8 @@ class OnlineTrainDataset(TrainDataset):
             DataTypeGT.SMPL_GENDER,
         }
         gt_dict, cond_dict = parse_data_struct(
-            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode
+            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode,
+            self.reappear_static,
         )
         if self.hand_align:
             # sliced below like every other (T, ...) gt tensor
@@ -435,6 +490,7 @@ class TestDataset(Dataset):
         input_conf_threshold: float = 0.0,
         test_split: str = "test",
         mask_mode: str = "zero",
+        reappear_static: int = 0,
         **kwargs,
     ):
         dataset_data = load_data(
@@ -451,6 +507,7 @@ class TestDataset(Dataset):
         self.use_real_input = use_real_input
         self.input_conf_threshold = input_conf_threshold
         self.mask_mode = mask_mode
+        self.reappear_static = reappear_static
 
         self.filename_list = []
         self.data = []
@@ -536,7 +593,8 @@ class TestDataset(Dataset):
             DataTypeGT.SMPL_GENDER,
         }
         gt_dict, cond_dict = parse_data_struct(
-            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode
+            data_dict, keys, self.use_real_input, self.input_conf_threshold, self.mask_mode,
+            self.reappear_static,
         )
         gt_dict[DataTypeGT.TRACKING_GAP] = (
             self.tracking_gaps[idx] if self.tracking_gaps else None

@@ -177,6 +177,14 @@ def add_model_options(parser):
         help="What a masked hand block becomes (confidence mask at train+eval, train masker segments): zeros or the last observed hand held.",
     )
     group.add_argument(
+        "--reappear_static_frames",
+        default=0,
+        type=int,
+        help="Reappearance rule: on the first N frames a hand is tracked again after a gap (confidence "
+             "gaps at train+eval, leading gaps included; train masker segments under --mask_mode hold), "
+             "its rotation velocity -> identity and position velocity -> 0.",
+    )
+    group.add_argument(
         "--learn_hand_offset",
         action="store_true",
         help="Learn a rigid controller->wrist offset per hand for the hand-alignment loss.",

@@ -108,6 +108,7 @@ class TrainLoop:
                     use_real_input=args.use_real_input,
                     input_conf_threshold=args.input_conf_threshold,
                     mask_mode=getattr(args, "mask_mode", "zero"),
+                    reappear_static=getattr(args, "reappear_static_frames", 0),
                 )
                 test_generator = create_generator(
                     args, model, test_dataset, device

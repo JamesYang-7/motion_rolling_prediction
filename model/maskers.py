@@ -19,6 +19,7 @@ def create_masker(
     min_f: int = 0,
     max_f: int = 1,
     mask_mode: str = "zero",
+    reappear_static: int = 0,
 )->Callable:
     idces = ConditionMasker.get_entities_idces(masker, dataset)
     if mask_mode == "hold":
@@ -37,6 +38,7 @@ def create_masker(
         min_f=min_f,
         max_f=max_f,
         mask_mode=mask_mode,
+        reappear_static=reappear_static,
     )
 
 
@@ -82,6 +84,7 @@ def mask_cond_segwise_by_idces(
     min_f: int = 0,
     max_f: int = 1,
     mask_mode: str = "zero",
+    reappear_static: int = 0,
     return_mask: bool = False,
     **kwargs
 ):
@@ -89,6 +92,7 @@ def mask_cond_segwise_by_idces(
     Mask the sparse embedding independently for each subset inside list of idces (indices)
     (same logic as in mask_cond_seqwise_by_idces).
     However, here we mask segments of length min_f to max_f instead of the whole sequence.
+    With reappear_static > 0 the frame(s) after a segment follow the reappearance rule.
     """
     assert max_f >= min_f, "max_f must be greater than or equal to min_f"
     cond = cond.clone()
@@ -107,8 +111,9 @@ def mask_cond_segwise_by_idces(
                     t0 = random.randint(0, n - length)
                     if mask_mode == "hold":
                         # idces = (left, right) hand blocks (seg_hands_idp) -> hand k = e + 1
-                        hold_segment(cond[i], t0, t0 + length, e + 1)
+                        hold_segment(cond[i], t0, t0 + length, e + 1, reappear_static)
                     else:
+                        assert reappear_static == 0, "reappear_static is implemented for mask_mode hold only"
                         cond[i, t0 : t0 + length, entity_idces] = 0
                     held[i, t0 : t0 + length, e] = True
         return (cond, held) if return_mask else cond

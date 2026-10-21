@@ -43,6 +43,7 @@ def main():
         input_conf_threshold=args.input_conf_threshold,
         test_split=args.test_split,
         mask_mode=getattr(args, "mask_mode", "zero"),
+        reappear_static=getattr(args, "reappear_static_frames", 0),
     )
     logger.info("Loading model...")
     model, _ = load_rpm_model(args, device=device)
