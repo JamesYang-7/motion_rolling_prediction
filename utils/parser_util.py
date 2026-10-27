@@ -22,6 +22,39 @@ from utils.constants import (
 )
 
 
+class ArgsFileParser(ArgumentParser):
+    """ArgumentParser that also reads `@file` argument files (the run configs
+    in configs/): one or more arguments per line, `#` starts a comment.
+    Arguments after the `@file` override it."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("fromfile_prefix_chars", "@")
+        super().__init__(*args, **kwargs)
+
+    def convert_arg_line_to_args(self, arg_line):
+        return arg_line.split("#", 1)[0].split()
+
+
+def apply_data_source(args):
+    """`--data_source vr_pose_pred`: the `.pt` files come from VR_Pose_Pred's
+    DATA_ROOT and the body models from its SUPPORT_DIR, both read through
+    config/local.yaml (utils/local_config.py); `--dataset_path` then only
+    holds the normalisation stats."""
+    args.data_root = None
+    if getattr(args, "data_source", "rpm") != "vr_pose_pred":
+        return args
+    from loguru import logger
+    from utils.local_config import vr_pose_pred_paths
+
+    paths = vr_pose_pred_paths()
+    args.data_root = paths["DATA_ROOT"]
+    if paths["SUPPORT_DIR"] is not None:
+        args.support_dir = paths["SUPPORT_DIR"]
+    logger.info(f"data source vr_pose_pred: DATA_ROOT {args.data_root}, "
+                f"support_dir {args.support_dir} (from {paths['source']})")
+    return args
+
+
 def parse_and_load_from_model(parser):
     # args according to the loaded model
     # do not try to specify them from cmd line since they will be overwritten
@@ -32,7 +65,7 @@ def parse_and_load_from_model(parser):
     args_to_overwrite = []
     if args.dataset == DatasetType.DEFAULT:
         #  if DEFAULT --> Different dataset is not specified by CMD --> use the one from the model
-        args_to_overwrite = ["support_dir", "dataset", "dataset_path", "results_dir"]
+        args_to_overwrite = ["support_dir", "dataset", "dataset_path", "results_dir", "data_source"]
     for group_name in [
         "model",
         "losses",
@@ -58,7 +91,7 @@ def parse_and_load_from_model(parser):
                     a, args.__dict__[a]
                 )
             )
-    return args
+    return apply_data_source(args)
 
 
 def get_args_per_group_name(parser, args, group_name):
@@ -72,6 +105,13 @@ def get_args_per_group_name(parser, args, group_name):
 
 
 def get_model_path_from_args():
+    # `--model_path` itself first (also from @file argument files, in any
+    # order); the upstream positional fallback takes the first bare token
+    parser = ArgsFileParser(add_help=False)
+    parser.add_argument("--model_path")
+    flagged, _ = parser.parse_known_args()
+    if flagged.model_path is not None:
+        return flagged.model_path
     try:
         dummy_parser = ArgumentParser()
         dummy_parser.add_argument("model_path")
@@ -317,6 +357,15 @@ def add_data_options(parser):
         help="the dir that you store your smplh and dmpls dirs",
     )
     group.add_argument(
+        "--data_source",
+        default="rpm",
+        choices=["rpm", "vr_pose_pred"],
+        help="rpm: <dataset_path>/<dataset>/new_format_data/<subset>/<split>/*.pt (upstream). "
+        "vr_pose_pred: <DATA_ROOT>/<dataset>/<subset>/<split>/*.pt, VR_Pose_Pred's own AMASS "
+        "trees, with DATA_ROOT and the body models' SUPPORT_DIR read through config/local.yaml; "
+        "the normalisation stats stay under <dataset_path>/<dataset>/new_format_data/.",
+    )
+    group.add_argument(
         "--dataset_max_samples",
         default=-1,
         type=int,
@@ -462,6 +511,32 @@ def add_sampling_options(parser):
     group.add_argument(
         "--eval_batch_size", default=1, type=int, help="Batch size during sampling."
     )
+    # Eval protocol; defaults = upstream. The AMASS majority protocol
+    # (VR_Pose_Pred): --eval_left_pad -1 --eval_skip_frames 0, plus
+    # --eval_fps 60 on AMASS-P2 (that tree is 60 fps).
+    group.add_argument(
+        "--eval_left_pad",
+        default=0,
+        type=int,
+        help="Prepend this many static frames to every test sequence (the first "
+        "frame held: GT pose, and the tracking frozen with rotvel identity / posvel 0) "
+        "and cut them before scoring, so the rollout's GT seed lies on padding. "
+        "-1 = auto = max(rolling ctx) + input_motion_length, the whole seed.",
+    )
+    group.add_argument(
+        "--eval_skip_frames",
+        default=-1,
+        type=int,
+        help="First scored frame. -1 = upstream (fps - 1: the first second is "
+        "skipped); 0 = every frame.",
+    )
+    group.add_argument(
+        "--eval_fps",
+        default=0,
+        type=int,
+        help="Frame rate of the test data for the metrics (velocity, jitter) and the "
+        "default skip. 0 = upstream per-dataset value (AMASS-P1 60, AMASS-P2 30, GORP 30).",
+    )
     group.add_argument(
         "--vis",
         action="store_true",
@@ -495,17 +570,17 @@ def add_evaluation_options(parser):
 
 
 def train_args():
-    parser = ArgumentParser()
+    parser = ArgsFileParser()
     add_base_options(parser)
     add_data_options(parser)
     add_model_options(parser)
     add_losses_options(parser)
     add_training_options(parser)
-    return parser.parse_args()
+    return apply_data_source(parser.parse_args())
 
 
 def sample_args():
-    parser = ArgumentParser()
+    parser = ArgsFileParser()
     # args specified by the user: (all other will be loaded from the model)
     add_base_options(parser)
     add_sampling_options(parser)
@@ -513,7 +588,7 @@ def sample_args():
 
 
 def evaluation_parser():
-    parser = ArgumentParser()
+    parser = ArgsFileParser()
     # args specified by the user: (all other will be loaded from the model)
     add_base_options(parser)
     add_evaluation_options(parser)

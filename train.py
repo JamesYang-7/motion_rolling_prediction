@@ -14,6 +14,7 @@ from data_loaders.dataloader import (
     get_dataloader,
     load_data,
     OnlineTrainDataset,
+    train_window_length,
 )
 from loguru import logger
 from runner.training_loop import TrainLoop
@@ -94,10 +95,9 @@ def main():
         args.dataset,
         args.dataset_path,
         "train",
-        total_length=args.input_motion_length
-        + max(args.rolling_motion_ctx, args.rolling_sparse_ctx)
-        + args.rolling_fr_frames,
+        total_length=train_window_length(args),
         max_samples=args.dataset_max_samples,
+        data_root=args.data_root,
     )
     dataset = OnlineTrainDataset(
         args.dataset,

@@ -23,6 +23,10 @@ INPUT_RHAND_IDCES = (42, 43, 44)
 # SMPL joints weighted by --loss_lower_weight (VR_Pose_Pred utils/layouts.py lower_joints)
 LOWER_BODY_JOINTS = (0, 1, 2, 4, 5, 7, 8, 10, 11)
 IDENTITY_6D = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+# width of the 3-point sparse vector; VR_Pose_Pred's AMASS trees store 90 dims
+# (+ 36 hand-in-head features after these 54), cut at load time
+SPARSE_DIM = 54
+SPARSE_FIELDS = ("hmd_position_global_full_gt_list", "hmd_position_global_full_real_list")
 
 
 def sparse_point_slices(k: int):

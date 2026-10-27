@@ -1,0 +1,58 @@
+# RPM-Reactive on AMASS-P2 under VR_Pose_Pred's AMASS protocol (the majority
+# one: SMPL-H male, zero betas, 60 fps, no tracking gaps), reading VR_Pose_Pred's
+# own .pt files (config/local.yaml). Every value is the released
+# checkpoints/amass_p2/reactive/args.json, except the lines marked CHANGED.
+# Released AMASS-P2 runs are at 30 fps; VR_Pose_Pred's P2 tree is 60 fps, so the
+# frame counts that encode time are doubled (CHANGED, user 2026-10-27): the
+# window 5 -> 10 frames, free-running 30 -> 60 (1 s); the step budget stays P2's.
+#   python train.py @configs/amass_ours/train_amass_p2_reactive.args
+# Arguments after the @file override it. Eval: configs/amass_ours/eval_amass_p2.args.
+
+# --- data (CHANGED: the protocol) ---
+--dataset amass_p2
+--data_source vr_pose_pred           # CHANGED: <DATA_ROOT>/amass_p2/<subset>/<split>/*.pt, SUPPORT_DIR body models
+--dataset_path ./datasets_processed_ours/   # CHANGED: holds only the normalisation stats (amass_p2_len80_*.pt)
+--results_dir ./results/amass_p2_ours       # CHANGED
+--exp_name reactive
+
+# --- model (released) ---
+--input_motion_length 10              # CHANGED (released 5 at 30 fps)
+--rolling_motion_ctx 10
+--rolling_sparse_ctx 10
+--rolling_fr_frames 60               # CHANGED (released 30 at 30 fps)
+--rolling_latency 0
+--target_type pcaf_cosine
+--prediction_input_type none
+--latent_dim 512
+--layers 4
+--num_heads 4
+--ff_size 1024
+--dropout 0.1
+--activation gelu
+--motion_nfeat 132
+--sparse_dim 54
+--masker seg_hands_idp
+--masker_minf 0
+--masker_maxf 10000
+--cond_mask_prob 0                   # CHANGED (released 0.1): no simulated gaps, our AMASS protocol
+
+# --- losses (released) ---
+--loss_dist_type L1
+--loss_velocity 1
+--loss_fk 1
+--loss_fk_vel 1
+
+# --- training (released) ---
+--seed 10
+--batch_size 512
+--lr 0.0003
+--weight_decay 0.0001
+--lr_anneal_steps 50000
+--num_steps 100000
+--train_dataset_repeat_times 100
+--save_interval 10
+--log_interval 1
+--num_workers 8
+--overwrite
+--keep_last_snapshots 1              # CHANGED: disk only (keep the newest numbered snapshot)
+# eval_during_training: released on; CHANGED to off (upstream's 1 s-skip eval, not ours; runs on the test split)

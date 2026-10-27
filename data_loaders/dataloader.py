@@ -491,13 +491,20 @@ class TestDataset(Dataset):
         test_split: str = "test",
         mask_mode: str = "zero",
         reappear_static: int = 0,
+        data_root: Optional[Path] = None,
+        train_window: Optional[int] = None,
         **kwargs,
     ):
+        # data_root: --data_source vr_pose_pred (load_data); its stats are named
+        # by the checkpoint's training window, so that window is needed here
+        assert data_root is None or train_window is not None, "data_root needs train_window"
         dataset_data = load_data(
             name,
             Path(dataset_path),
             test_split,
             max_samples=max_samples,
+            data_root=data_root,
+            **({} if train_window is None else {"total_length": train_window}),
         )
         self.name = name
         self.mean = dataset_data.mean
@@ -610,6 +617,12 @@ def get_mean_std_path(dataset):
     return dataset + "_mean.pt", dataset + "_std.pt"
 
 
+def train_window_length(args) -> int:
+    """Frames one training sample spans (train.py's `total_length`): shorter
+    training sequences are filtered out."""
+    return args.input_motion_length + max(args.rolling_motion_ctx, args.rolling_sparse_ctx) + args.rolling_fr_frames
+
+
 def get_motion(motion_list):
     # rotation_local_full_gt_list : 6d rotation parameters
     # hmd_position_global_full_gt_list : 3 joints(head, hands) 6d rotation/6d rotation velocity/global translation/global translation velocity
@@ -634,9 +647,18 @@ def load_data(
     split: str,
     total_length:int=196,
     max_samples:int=-1,
+    data_root: Optional[Path] = None,
 ) -> DatasetDataStruct:
     """
     Collect the data for the given split
+
+    `data_root` (`--data_source vr_pose_pred`): the .pt files are read from
+    <data_root>/<dataset>/<subset>/<split>/ (VR_Pose_Pred's own AMASS layout),
+    sorted so the order does not depend on the platform; the stats stay in
+    <dataset_path>/<dataset>/new_format_data/ and are named per training
+    window (`<dataset>_len<total_length>_{mean,std}.pt`), so runs with
+    different windows (reactive / smooth) that start together each compute
+    and keep their own, as each would on a fresh upstream root.
 
     Args:
         - For test:
@@ -663,13 +685,26 @@ def load_data(
             std : std of train dataset
     """
     dataset_path = dataset_path / dataset.value / "new_format_data"
-    motion_list = get_path(dataset_path, split)
-    assert len(motion_list) > 0, f"No data found in {dataset_path / split}"
+    if data_root is None:
+        motion_list = get_path(dataset_path, split)
+        mean_path, std_path = get_mean_std_path(dataset)
+        source_path = dataset_path
+    else:
+        source_path = Path(data_root) / dataset.value
+        motion_list = sorted(get_path(source_path, split))
+        mean_path, std_path = get_mean_std_path(f"{dataset.value}_len{total_length}")
+    assert len(motion_list) > 0, f"No data found in {source_path} (*/{split}/*.pt)"
     if max_samples != -1:
         motion_list = motion_list[:max_samples]
-    mean_path, std_path = get_mean_std_path(dataset)
-    logger.info(f"Loading '{split}' data: {dataset_path}")
+    logger.info(f"Loading '{split}' data: {source_path}")
     data = [torch.load(i) for i in tqdm(motion_list)]
+    for data_dict in data:
+        # VR_Pose_Pred's AMASS trees: 90-d float64 sparse (54 + hand-in-head
+        # extras) -> RPM's 54-d float32 layout; RPM's own data is untouched
+        for field in constants.SPARSE_FIELDS:
+            sp = data_dict.get(field)
+            if sp is not None and sp.shape[-1] > constants.SPARSE_DIM:
+                data_dict[field] = sp[..., : constants.SPARSE_DIM].float()
 
     filename_list = [
         "-".join([i.parts[-3], i.parts[-1]]).split(".")[0]
@@ -711,6 +746,7 @@ def load_data(
         tmp_data_list = torch.cat(all_motions, dim=0)
         mean = tmp_data_list.mean(dim=0).float()
         std = tmp_data_list.std(dim=0).float()
+        dataset_path.mkdir(parents=True, exist_ok=True)  # stats-only dir under data_root
         with open((dataset_path / mean_path), "wb") as f:
             torch.save(mean, f)
         with open((dataset_path / std_path), "wb") as f:

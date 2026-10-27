@@ -7,7 +7,7 @@ import random
 import numpy as np
 import torch
 
-from data_loaders.dataloader import TestDataset
+from data_loaders.dataloader import TestDataset, train_window_length
 from evaluation.evaluation import EvaluatorWrapper
 from evaluation.generators import create_generator
 
@@ -44,6 +44,8 @@ def main():
         test_split=args.test_split,
         mask_mode=getattr(args, "mask_mode", "zero"),
         reappear_static=getattr(args, "reappear_static_frames", 0),
+        data_root=args.data_root,
+        train_window=train_window_length(args) if args.data_root is not None else None,
     )
     logger.info("Loading model...")
     model, _ = load_rpm_model(args, device=device)

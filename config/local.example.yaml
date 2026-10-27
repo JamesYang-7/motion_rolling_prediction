@@ -1,0 +1,12 @@
+# Machine-local paths for `--data_source vr_pose_pred` (RPM trained and
+# evaluated on VR_Pose_Pred's own AMASS trees: configs/amass_ours/).
+# Copy to config/local.yaml (gitignored) and edit.
+#
+# Preferred: name VR_Pose_Pred's own local config, so RPM reads the same
+# DATA_ROOT (<DATA_ROOT>/amass_p1, amass_p2) and the same SUPPORT_DIR
+# (smplh/, dmpls/ body models) as VR_Pose_Pred on this machine.
+VR_POSE_PRED_LOCAL: "F:/Research/VR_Pose_Pred/config/local.yaml"
+
+# Or set them here (these win over the file above):
+# DATA_ROOT: "E:/Data/AMASS/processed"
+# SUPPORT_DIR: "E:/Data/AMASS/body_models"

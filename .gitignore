@@ -10,3 +10,5 @@ datasets_processed/amass_p2/new_format_data/*/
 datasets_processed/gorp/new_format_data/*/
 datasets_processed_mc/
 /export/
+datasets_processed_ours/
+config/local.yaml

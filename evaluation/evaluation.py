@@ -22,7 +22,14 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Sampler
 from tqdm import tqdm
 
-from utils.constants import DataTypeGT, ModelOutputType, SMPLGenderParam, SMPLModelType
+from utils.constants import (
+    DataTypeGT,
+    IDENTITY_6D,
+    ModelOutputType,
+    SMPLGenderParam,
+    SMPLModelType,
+    sparse_point_slices,
+)
 from utils.metrics import (
     AccumulateArray,
     AverageValue,
@@ -38,6 +45,40 @@ from utils.metrics import (
 )
 
 from pathlib import Path
+
+
+def resolve_left_pad(args) -> int:
+    """`--eval_left_pad`: -1 = auto = the rollout's whole GT seed, i.e. the
+    max(motion, sparse) context the generator copies from GT plus the
+    `input_motion_length` GT window it takes as the first PCAF anchor."""
+    left_pad = int(getattr(args, "eval_left_pad", 0))
+    if left_pad == -1:
+        left_pad = max(args.rolling_motion_ctx, args.rolling_sparse_ctx) + args.input_motion_length
+    assert left_pad >= 0, f"eval_left_pad must be >= 0 or -1 (auto), got {left_pad}"
+    return left_pad
+
+
+def left_pad_static(gt_data: torch.Tensor, sparse: torch.Tensor, n: int):
+    """Prepend `n` static frames to a (B, T, F) batch; port of VR_Pose_Pred
+    `test.py:_prep_sequence` / `dataloader.py:_static_padding_block`
+    (EVAL_LEFT_PAD): the GT motion holds the first frame's pose, the tracking
+    input is frozen at its first frame (rot / pos copied, rotvel identity,
+    posvel 0; a point whose rotation block is all zeros, i.e. masked, stays
+    all zeros). The rollout's GT seed then lies on padding, and the only GT
+    pose the model sees is the held first frame."""
+    if n <= 0:
+        return gt_data, sparse
+    frozen = sparse[:, :1].clone()
+    for k in range(3):
+        rot_s, rotvel_s, _, posvel_s = sparse_point_slices(k)
+        observed = (frozen[..., rot_s].abs().sum(dim=-1, keepdim=True) > 0).to(frozen.dtype)
+        identity = torch.tensor(IDENTITY_6D, dtype=frozen.dtype, device=frozen.device)
+        frozen[..., rotvel_s] = identity * observed
+        frozen[..., posvel_s] = 0.0
+    gt_data = torch.cat((gt_data[:, :1].expand(-1, n, -1), gt_data), dim=1)
+    sparse = torch.cat((frozen.expand(-1, n, -1), sparse), dim=1)
+    return gt_data, sparse
+
 
 def padding_collate(batch):
     """
@@ -106,8 +147,21 @@ class EvaluatorWrapper:
         self.dataset_name = args.dataset
         self.device = device
         self.body_model = body_model
-        self.fps = get_dataset_fps(self.dataset_name)
-        self.MIN_FRAMES_TO_EVAL = get_min_frames_to_eval(self.dataset_name)
+        # Eval protocol (sampling flags; the defaults are upstream's):
+        # `--eval_fps` overrides the dataset's frame rate (our AMASS-P2 tree is
+        # 60 fps, upstream's 30), `--eval_skip_frames` the frames dropped before
+        # scoring (upstream: 1 s, the slice starting at frame fps - 1), and
+        # `--eval_left_pad` prepends static frames that are cut again before
+        # scoring (`left_pad_static`).
+        eval_fps = int(getattr(args, "eval_fps", 0))
+        self.fps = eval_fps if eval_fps > 0 else get_dataset_fps(self.dataset_name)
+        skip = int(getattr(args, "eval_skip_frames", -1))
+        if skip < 0:
+            skip = (self.fps if eval_fps > 0 else get_min_frames_to_eval(self.dataset_name)) - 1
+        self.skip = skip
+        self.left_pad = resolve_left_pad(args)
+        logger.info(f"Eval protocol: {self.fps} fps, first scored frame {self.skip}, "
+                    f"{self.left_pad} static left-padding frames")
         self.batch_size = batch_size
 
         # initialize data loader. Sorting the dataset by sequence length to
@@ -121,7 +175,7 @@ class EvaluatorWrapper:
             pin_memory=True,
             drop_last=False,
             collate_fn=padding_collate,
-            sampler=SortedSampler(self.dataset, min_frames=self.MIN_FRAMES_TO_EVAL + 3),
+            sampler=SortedSampler(self.dataset, min_frames=self.skip + 4),
         )
 
     def evaluate_from_prediction(
@@ -154,14 +208,14 @@ class EvaluatorWrapper:
             model_type,
         )
 
-        pr_pos = pr_body.Jtr[self.MIN_FRAMES_TO_EVAL - 1 :, :22, :]
+        pr_pos = pr_body.Jtr[self.skip :, :22, :]
         pr_angle = pr_body.full_pose.reshape(pr_body.Jtr.shape)[
-            self.MIN_FRAMES_TO_EVAL - 1 :, :22
+            self.skip :, :22
         ]
 
-        gt_pos = gt_body.Jtr[self.MIN_FRAMES_TO_EVAL - 1 :, :22, :]
+        gt_pos = gt_body.Jtr[self.skip :, :22, :]
         gt_angle = gt_body.full_pose.reshape(pr_body.Jtr.shape)[
-            self.MIN_FRAMES_TO_EVAL - 1 :, :22
+            self.skip :, :22
         ]
 
         metrics_sets = [
@@ -171,17 +225,17 @@ class EvaluatorWrapper:
         if gaps is not None:
             metrics_sets.append(get_all_metrics_trackingloss())
             masks = from_gaps_to_masks(
-                gaps, output.shape[0], self.MIN_FRAMES_TO_EVAL - 1
+                gaps, output.shape[0], self.skip
             )
-            processed_gaps = remove_frames_to_gaps(gaps, self.MIN_FRAMES_TO_EVAL - 1)
+            processed_gaps = remove_frames_to_gaps(gaps, self.skip)
 
         metrics_input_data = MetricsInputData(
             pred_positions=pr_pos,
             pred_angles=pr_angle,
-            pred_mesh=pr_body.v[self.MIN_FRAMES_TO_EVAL - 1 :],
+            pred_mesh=pr_body.v[self.skip :],
             gt_positions=gt_pos,
             gt_angles=gt_angle,
-            gt_mesh=gt_body.v[self.MIN_FRAMES_TO_EVAL - 1 :],
+            gt_mesh=gt_body.v[self.skip :],
             fps=self.fps,
             trackingloss_masks=masks,
             gaps=processed_gaps,
@@ -194,6 +248,26 @@ class EvaluatorWrapper:
                 )
         return eval_log
 
+    def generate(self, gt_data, sparse, filenames):
+        """Rolling generation over (B, T, F) inputs with `self.left_pad` static
+        frames in front (`left_pad_static`); the padding is cut from the
+        outputs again, so they align with the original frames."""
+        gt_data, sparse = left_pad_static(gt_data, sparse, self.left_pad)
+        output, _ = self.generator(
+            gt_data,
+            sparse,
+            body_model=self.body_model.get_body_model(
+                SMPLModelType.SMPLX, SMPLGenderParam.NEUTRAL
+            ),
+            filenames=filenames,
+        )
+        if self.left_pad > 0:
+            output = {
+                k: v[:, self.left_pad:] if v is not None else None
+                for k, v in output.items()
+            }
+        return output
+
     def evaluate_single(self, sample_idx):
         gt_dict, cond_dict = self.dataset[sample_idx]
         gt_data = gt_dict[DataTypeGT.RELATIVE_ROTS]
@@ -204,13 +278,8 @@ class EvaluatorWrapper:
         gt_gender = gt_dict[DataTypeGT.SMPL_GENDER]
         model_type = gt_dict[DataTypeGT.SMPL_MODEL_TYPE]
 
-        output, _ = self.generator(
-            gt_data.unsqueeze(0),
-            sparse.unsqueeze(0),
-            body_model=self.body_model.get_body_model(
-                SMPLModelType.SMPLX, SMPLGenderParam.NEUTRAL
-            ),
-            filenames=gt_dict[DataTypeGT.FILENAME],
+        output = self.generate(
+            gt_data.unsqueeze(0), sparse.unsqueeze(0), gt_dict[DataTypeGT.FILENAME]
         )
         local_rot = output[ModelOutputType.RELATIVE_ROTS][0]
         betas = None
@@ -261,14 +330,7 @@ class EvaluatorWrapper:
                 batch_size = len(num_frames)
 
                 # inference
-                output, _ = self.generator(
-                    gt_data,
-                    sparse,
-                    body_model=self.body_model.get_body_model(
-                        SMPLModelType.SMPLX, SMPLGenderParam.NEUTRAL
-                    ),
-                    filenames=filenames,
-                )
+                output = self.generate(gt_data, sparse, filenames)
 
                 local_rot = output[ModelOutputType.RELATIVE_ROTS]
                 betas = None

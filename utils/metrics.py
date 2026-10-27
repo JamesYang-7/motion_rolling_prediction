@@ -49,6 +49,7 @@ class RestrictType(str, Enum):
 
 BODY_ENTITIES = {
     "all": list(range(22)),
+    "body": list(range(1, 22)),  # without the root (global orientation)
     "hands": [20, 21],
     "upper": [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
     "lower": [0, 1, 2, 4, 5, 7, 8, 10, 11],
@@ -297,7 +298,10 @@ METRIC_FUNCS_DICT = {
     "mpjre": mpjre,
     "mpjpe": mpjpe,
     "mpjve": mpjve,
-    #"handpe": partial(mpjpe, joints="hands"),
+    # the AMASS majority protocol's MPJRE (21 body joints, no root: AvatarJLM's
+    # definition, VR_Pose_Pred `mpjre`) and hand PE (the two wrists)
+    "mpjre_body": partial(mpjre, joints="body"),
+    "handpe": partial(mpjpe, joints="hands"),
     #"upperpe": partial(mpjpe, joints="upper"),
     #"lowerpe": partial(mpjpe, joints="lower"),
     #"rootpe": partial(mpjpe, joints="root"),
@@ -431,7 +435,8 @@ LOGGING_METRICS = {
     "mpjre",
     "mpjpe",
     "mpjve",
-    # "handpe",
+    "mpjre_body",
+    "handpe",
     # "upperpe",
     # "lowerpe",
     # "rootpe",
