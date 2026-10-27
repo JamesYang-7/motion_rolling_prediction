@@ -135,7 +135,10 @@ class TrainLoop:
 
         if resume_checkpoint:
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
-            self.resume_epoch = self.resume_step // len(self.data) + 1
+            # Checkpoints are only written at epoch ends, so resume_step = k * len(data)
+            # with k epochs done, and run_loop's 0-based index of the next one is k
+            # (upstream added 1 here, so a resumed run trained one epoch fewer).
+            self.resume_epoch = self.resume_step // len(self.data)
             logger.log(
                 f"loading model from checkpoint: {resume_checkpoint} at epoch {self.resume_epoch}..."
             )
