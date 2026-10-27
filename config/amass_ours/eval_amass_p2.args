@@ -5,7 +5,7 @@
 # first-frame pose; the P2 tree is 60 fps (RPM's own P2: 30). Report mpjre_body
 # (21 body joints = VR_Pose_Pred's mpjre), mpjpe, mpjve, pred_jitter / 100 and
 # handpe; gt_jitter must read 292.48.
-#   python test.py --model_path ./results/amass_p2_ours/checkpoints/<reactive|smooth>/model_latest.pt @configs/amass_ours/eval_amass_p2.args
+#   python test.py --model_path ./results/amass_p2_ours/checkpoints/<reactive|smooth>/model_latest.pt @config/amass_ours/eval_amass_p2.args
 --eval
 --eval_batch_size 16
 --dataset amass_p2

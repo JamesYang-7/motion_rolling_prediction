@@ -2,8 +2,8 @@
 # one: SMPL-H male, zero betas, 60 fps, no tracking gaps), reading VR_Pose_Pred's
 # own .pt files (config/local.yaml). Every value is the released
 # checkpoints/amass_p1/reactive/args.json, except the lines marked CHANGED.
-#   python train.py @configs/amass_ours/train_amass_p1_reactive.args
-# Arguments after the @file override it. Eval: configs/amass_ours/eval_amass_p1.args.
+#   python train.py @config/amass_ours/train_amass_p1_reactive.args
+# Arguments after the @file override it. Eval: config/amass_ours/eval_amass_p1.args.
 
 # --- data (CHANGED: the protocol) ---
 --dataset amass_p1

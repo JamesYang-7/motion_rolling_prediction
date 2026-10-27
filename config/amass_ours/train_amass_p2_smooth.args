@@ -5,8 +5,8 @@
 # Released AMASS-P2 runs are at 30 fps; VR_Pose_Pred's P2 tree is 60 fps, so the
 # frame counts that encode time are doubled (CHANGED, user 2026-10-27): the
 # window 10 -> 20 frames, free-running 30 -> 60 (1 s); the step budget stays P2's.
-#   python train.py @configs/amass_ours/train_amass_p2_smooth.args
-# Arguments after the @file override it. Eval: configs/amass_ours/eval_amass_p2.args.
+#   python train.py @config/amass_ours/train_amass_p2_smooth.args
+# Arguments after the @file override it. Eval: config/amass_ours/eval_amass_p2.args.
 
 # --- data (CHANGED: the protocol) ---
 --dataset amass_p2

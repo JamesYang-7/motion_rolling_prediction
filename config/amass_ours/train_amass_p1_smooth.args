@@ -3,8 +3,8 @@
 # own .pt files (config/local.yaml). Every value is the released
 # checkpoints/amass_p1/smooth/args.json, except the lines marked CHANGED
 # (that release ships no weights, model_latest.pt is 0 bytes, but its args.json).
-#   python train.py @configs/amass_ours/train_amass_p1_smooth.args
-# Arguments after the @file override it. Eval: configs/amass_ours/eval_amass_p1.args.
+#   python train.py @config/amass_ours/train_amass_p1_smooth.args
+# Arguments after the @file override it. Eval: config/amass_ours/eval_amass_p1.args.
 
 # --- data (CHANGED: the protocol) ---
 --dataset amass_p1

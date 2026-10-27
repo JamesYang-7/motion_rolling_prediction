@@ -4,7 +4,7 @@
 # frames + the first W-frame anchor), so the only GT the model sees is the held
 # first-frame pose. Report mpjre_body (21 body joints = VR_Pose_Pred's mpjre),
 # mpjpe, mpjve, pred_jitter / 100 and handpe; gt_jitter must read 400.61.
-#   python test.py --model_path ./results/amass_p1_ours/checkpoints/<reactive|smooth>/model_latest.pt @configs/amass_ours/eval_amass_p1.args
+#   python test.py --model_path ./results/amass_p1_ours/checkpoints/<reactive|smooth>/model_latest.pt @config/amass_ours/eval_amass_p1.args
 --eval
 --eval_batch_size 16
 --dataset amass_p1
