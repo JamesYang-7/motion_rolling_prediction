@@ -24,7 +24,7 @@ from utils.constants import (
 
 class ArgsFileParser(ArgumentParser):
     """ArgumentParser that also reads `@file` argument files (the run configs
-    in configs/): one or more arguments per line, `#` starts a comment.
+    in config/): one or more arguments per line, `#` starts a comment.
     Arguments after the `@file` override it."""
 
     def __init__(self, *args, **kwargs):

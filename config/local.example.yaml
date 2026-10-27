@@ -1,5 +1,5 @@
 # Machine-local paths for `--data_source vr_pose_pred` (RPM trained and
-# evaluated on VR_Pose_Pred's own AMASS trees: configs/amass_ours/).
+# evaluated on VR_Pose_Pred's own AMASS trees: config/amass_ours/).
 # Copy to config/local.yaml (gitignored) and edit.
 #
 # Preferred: name VR_Pose_Pred's own local config, so RPM reads the same
